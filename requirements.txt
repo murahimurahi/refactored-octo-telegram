@@ -1,4 +1,4 @@
-fastapi
-uvicorn
-requests
-line-bot-sdk
+fastapi>=0.114
+uvicorn[standard]>=0.30
+line-bot-sdk>=3.11
+requests>=2.31
