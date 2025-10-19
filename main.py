@@ -69,3 +69,49 @@ async def callback(request: Request):
                 pass
 
     return JSONResponse({"status": "ok"})
+# 先頭の import の所に追加
+import httpx
+
+# --- ここから追記 ---
+# 対応都市（必要なら増やせばOK）
+CITY_DB = {
+    "東京": ("Tokyo", 35.676, 139.650),
+    "名古屋": ("Nagoya", 35.1815, 136.9066),
+    "大阪": ("Osaka", 34.6937, 135.5023),
+}
+
+def pick_city(text: str):
+    t = text.lower()
+    for ja, (en, lat, lon) in CITY_DB.items():
+        if ja in text or en.lower() in t:
+            return ja, lat, lon
+    return "東京", *CITY_DB["東京"][1:]  # デフォルト東京
+
+async def handle_weather(text: str) -> str:
+    # 「天気」が含まれなければ従来どおりエコー
+    if "天気" not in text:
+        return f"受け取りました: {text}"
+
+    city_ja, lat, lon = pick_city(text)
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&current_weather=true&timezone=Asia%2FTokyo"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            cw = r.json()["current_weather"]
+        temp = cw.get("temperature")
+        wind = cw.get("windspeed")
+        return f"{city_ja}の天気: 気温 {temp}°C / 風速 {wind} m/s"
+    except Exception:
+        return f"{city_ja}の天気取得に失敗しました。少し待って再度お試しください。"
+# --- ここまで追記 ---
+
+# （LINEのテキスト受信処理の中）
+# user_text = event.message.text.strip()
+# これまでの「受け取りました: ...」を返す行を以下に差し替え
+reply_text = await handle_weather(user_text)
+line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
