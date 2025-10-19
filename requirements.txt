@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-sqlalchemy>=2.0
-psycopg[binary]
-python-dateutil
+fastapi==0.115.2
+uvicorn==0.30.6
+SQLAlchemy==2.0.35
+psycopg[binary]==3.2.3
+python-dateutil==2.9.0.post0
