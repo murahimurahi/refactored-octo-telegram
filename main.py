@@ -1,6 +1,4 @@
-import os
-import requests
-from fastapi import FastAPI, Request
+
 from fastapi.responses import JSONResponse
 
 # LINE SDK（既存のトークンを使う前提）
