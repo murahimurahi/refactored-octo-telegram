@@ -114,4 +114,4 @@ async def handle_weather(text: str) -> str:
 # user_text = event.message.text.strip()
 # これまでの「受け取りました: ...」を返す行を以下に差し替え
 reply_text = await handle_weather(user_text)
-line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+line_bot_api.reply_message(event.reply
