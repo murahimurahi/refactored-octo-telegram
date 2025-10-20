@@ -1,13 +1,9 @@
-# main.py
-import os
-import random
-import requests
+# main.py ー 乙4クイズ50問（LINE）/ クイックリプライ / SQLite成績 / 10問ごと途中成績 & 最終成績 / /health
+import os, random, sqlite3
 from typing import Dict, Any
-
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 
-# LINE SDK
 from linebot import LineBotApi, WebhookParser
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
@@ -18,173 +14,255 @@ from linebot.models import (
 # ===== 環境変数 =====
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "")
-
-if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
-    # Render 起動時の分かりやすいエラー
-    print("⚠️ LINE の環境変数が設定されていません")
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 
 app = FastAPI()
 
-# ====== In-Memory ユーザ状態（簡易）======
-# user_state[user_id] = {"answer": 1-4}
-user_state: Dict[str, Dict[str, Any]] = {}
+# ===== SQLite（成績保存）=====
+conn = sqlite3.connect("results.db", check_same_thread=False)
+cur = conn.cursor()
+cur.execute("""
+CREATE TABLE IF NOT EXISTS results (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT,
+  qid INTEGER,
+  correct INTEGER,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+""")
+conn.commit()
 
-# ===== ヘルスチェック =====
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+def save_result(user_id: str, qid: int, correct: bool):
+    cur.execute("INSERT INTO results (user_id, qid, correct) VALUES (?, ?, ?)",
+                (user_id, qid, 1 if correct else 0))
+    conn.commit()
 
-# ===== 天気（OpenWeatherMap）=====
-def fetch_weather(city: str) -> str:
-    if not OPENWEATHER_API_KEY:
-        return "天気 APIキーが未設定です（OPENWEATHER_API_KEY）。"
-    try:
-        url = "https://api.openweathermap.org/data/2.5/weather"
-        params = {"q": city, "appid": OPENWEATHER_API_KEY, "lang": "ja", "units": "metric"}
-        r = requests.get(url, params=params, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        desc = data["weather"][0]["description"]
-        temp = data["main"]["temp"]
-        return f"{city}の天気: {desc} / 気温: {temp:.1f}℃"
-    except Exception as e:
-        return f"天気取得に失敗しました: {e}"
+def get_stats(user_id: str):
+    cur.execute("SELECT COUNT(*), SUM(correct) FROM results WHERE user_id=?", (user_id,))
+    total, ok = cur.fetchone()
+    total = total or 0
+    ok = ok or 0
+    rate = round((ok/total)*100, 1) if total else 0.0
+    return total, ok, rate
 
-# ===== クイックリプライ共通 =====
-def qr_choices():
+# ===== クイックリプライ =====
+def qr_choices(choices: list[str]):
+    marks = ["①", "②", "③", "④"]
+    items = []
+    for i, ch in enumerate(choices):
+        items.append(QuickReplyButton(action=MessageAction(label=f"{marks[i]} {ch}", text=str(i+1))))
+    items.append(QuickReplyButton(action=MessageAction(label="次の問題", text="次の問題")))
+    items.append(QuickReplyButton(action=MessageAction(label="成績確認", text="成績確認")))
+    return QuickReply(items=items)
+
+def qr_menu():
     return QuickReply(items=[
-        QuickReplyButton(action=MessageAction(label="①", text="①")),
-        QuickReplyButton(action=MessageAction(label="②", text="②")),
-        QuickReplyButton(action=MessageAction(label="③", text="③")),
-        QuickReplyButton(action=MessageAction(label="④", text="④")),
+        QuickReplyButton(action=MessageAction(label="問題", text="問題")),
         QuickReplyButton(action=MessageAction(label="次の問題", text="次の問題")),
-        QuickReplyButton(action=MessageAction(label="ヘルプ", text="ヘルプ")),
-    ])
-
-def qr_next():
-    return QuickReply(items=[
-        QuickReplyButton(action=MessageAction(label="次の問題", text="次の問題")),
-        QuickReplyButton(action=MessageAction(label="天気 例", text="天気 名古屋")),
+        QuickReplyButton(action=MessageAction(label="ステータス", text="ステータス")),
+        QuickReplyButton(action=MessageAction(label="成績確認", text="成績確認")),
+        QuickReplyButton(action=MessageAction(label="リセット", text="リセット")),
         QuickReplyButton(action=MessageAction(label="ヘルプ", text="ヘルプ")),
     ])
 
 HELP_TEXT = (
-    "使い方：\n"
-    "・「問題」→ 乙4 四択を出題（全50問からランダム）\n"
-    "・「①②③④」をタップ→ 正誤判定\n"
-    "・「次の問題」→ 次のランダム問題\n"
-    "・「◯◯の天気」または「天気 ◯◯」→ 天気表示（例：天気 名古屋）"
+    "📘 乙４クイズBot（全50問）\n"
+    "・『問題』『次の問題』→ 出題\n"
+    "・①〜④をタップ→ 採点\n"
+    "・10問ごとに途中成績、50問目で最終成績を自動表示\n"
+    "・『ステータス』→ 途中成績\n"
+    "・『成績確認』→ これまでの累積正答率（DB）\n"
+    "・『リセット』→ 50問セッションやり直し\n"
 )
 
-# ====== 乙4：50問 ======
-# answer は 1～4（①～④）
-questions = [
-    {"question": "アセトンは第4類の何に分類されるか？", "choices": ["第1石油類", "アルコール類", "第2石油類", "特殊引火物"], "answer": 2},
-    {"question": "ガソリンの引火点に最も近いのは？", "choices": ["−20℃", "0℃", "30℃", "100℃"], "answer": 1},
-    {"question": "灯油は第4類の何に分類されるか？", "choices": ["第1石油類", "第2石油類", "第3石油類", "第4石油類"], "answer": 2},
-    {"question": "軽油は第4類の何に分類されるか？", "choices": ["第1石油類", "第2石油類", "第3石油類", "特殊引火物"], "answer": 3},
-    {"question": "重油は第4類の何に分類されるか？", "choices": ["第2石油類", "第3石油類", "第4石油類", "アルコール類"], "answer": 3},
-    {"question": "エタノールの分類は？", "choices": ["第1石油類", "第2石油類", "アルコール類", "自動車用燃料"], "answer": 3},
-    {"question": "メタノールの分類は？", "choices": ["第1石油類", "アルコール類", "第2石油類", "第3石油類"], "answer": 2},
-    {"question": "第1石油類の貯蔵の特徴は？", "choices": ["水より軽く混ざらない", "引火点が低い", "引火点が高い", "水に溶ける"], "answer": 2},
-    {"question": "指定数量の定義として正しいのは？", "choices": ["製造上の量", "取扱いの基準量", "法令で危険物とみなす基準量", "容器の容量"], "answer": 3},
-    {"question": "灯油（第2石油類：石油類）の指定数量は？", "choices": ["100L", "200L", "1000L", "2000L"], "answer": 3},
-    {"question": "ガソリン（第1石油類）の指定数量は？", "choices": ["100L", "200L", "400L", "1000L"], "answer": 1},
-    {"question": "重油（第4石油類）の指定数量は？", "choices": ["1000L", "2000L", "3000L", "4000L"], "answer": 2},
-    {"question": "第1石油類の貯蔵容器として望ましい材質は？", "choices": ["ガラス", "ポリエチレン薄肉", "金属容器", "紙容器"], "answer": 3},
-    {"question": "アルコール類に該当するものはどれ？", "choices": ["酢酸エチル", "イソプロパノール", "トルエン", "軽油"], "answer": 2},
-    {"question": "危険物の標識で赤地に黒文字の意味は？", "choices": ["引火性液体", "酸化性固体", "自然発火性物質", "可燃性固体"], "answer": 1},
-    {"question": "静電気対策として誤りは？", "choices": ["接地をする", "注入速度を上げる", "導電性ホースを使う", "湿度を保つ"], "answer": 2},
-    {"question": "危険物の保管で『冷暗所』が必要なのは？", "choices": ["ガソリン", "メタノール", "アセトン", "全て"], "answer": 4},
-    {"question": "泡消火薬剤が最も有効なのは？", "choices": ["金属火災", "電気火災", "油火災", "可燃性固体火災"], "answer": 3},
-    {"question": "水系消火が不適なものは？", "choices": ["紙火災", "木材火災", "油火災", "布火災"], "answer": 3},
-    {"question": "ガソリンの主な危険性は？", "choices": ["腐食性", "酸化性", "引火性・爆発性", "毒性のみ"], "answer": 3},
-    {"question": "危険物施設の『少量危険物』とは？", "choices": ["指定数量未満", "指定数量の2倍", "指定数量の10分の1未満", "制限なし"], "answer": 3},
-    {"question": "第2石油類の代表例は？", "choices": ["灯油・ジェット燃料", "ガソリン", "重油", "ベンゼン"], "answer": 1},
-    {"question": "貯蔵タンクの防油堤の目的は？", "choices": ["換気", "漏えい拡大防止", "冷却", "装飾"], "answer": 2},
-    {"question": "可燃性蒸気が最も溜まりやすい場所は？", "choices": ["高所", "低所・ピット", "屋外上空", "乾燥地帯"], "answer": 2},
-    {"question": "危険物の『混載禁止』の理由は？", "choices": ["重量超過", "反応・危険増大", "税制の問題", "臭気の問題のみ"], "answer": 2},
-    {"question": "引火点とは？", "choices": ["自然に燃える温度", "炎を近づけると燃えだす最低温度", "沸点", "発火点"], "answer": 2},
-    {"question": "発火点とは？", "choices": ["外部からの炎で燃える温度", "自然に燃え始める温度", "引火点と同じ", "凝固点"], "answer": 2},
-    {"question": "第3石油類の代表例は？", "choices": ["ベンゼン", "軽油", "ギヤオイル・クレオソート油", "ガソリン"], "answer": 3},
-    {"question": "指定数量以上の貯蔵で必要になるのは？", "choices": ["特になし", "市町村長への届出", "許可", "ラベルのみ"], "answer": 3},
-    {"question": "危険物施設の定期点検主目的は？", "choices": ["見栄え向上", "事故防止", "生産性向上", "費用削減"], "answer": 2},
-    {"question": "水溶性の第1石油類は？", "choices": ["ベンゼン", "トルエン", "アセトン", "灯油"], "answer": 3},
-    {"question": "アルコール類に共通する消火方法として有効なのは？", "choices": ["粉末・泡（耐アルコール性）", "水のみ", "二酸化炭素のみ", "砂のみ"], "answer": 1},
-    {"question": "危険物の容器表示で誤りは？", "choices": ["内容物名", "危険等級", "指定数量を記載", "注意事項"], "answer": 3},
-    {"question": "屋内タンクの換気で重要なのは？", "choices": ["送風のみ", "給気・排気のバランス", "遮光のみ", "冷却のみ"], "answer": 2},
-    {"question": "第4類全般の共通的な主危険は？", "choices": ["酸化性", "腐食性", "引火性", "圧縮性"], "answer": 3},
-    {"question": "気化しやすい順に近いのは？（常温）", "choices": ["ガソリン＞灯油＞重油", "灯油＞ガソリン＞重油", "重油＞灯油＞ガソリン", "ほぼ同じ"], "answer": 1},
-    {"question": "指定数量の倍数が増えると要求されるのは？", "choices": ["標識縮小", "緩和措置", "安全対策の強化", "関係なし"], "answer": 3},
-    {"question": "メタノールの主な危険・有害性で注意すべきは？", "choices": ["強い腐食性", "吸入毒性・失明の恐れ", "放射性", "窒息性"], "answer": 2},
-    {"question": "危険物帳簿で最低限必要なのは？", "choices": ["装飾", "数量・入出庫・品名等の記録", "気温記録のみ", "不要"], "answer": 2},
-    {"question": "火気厳禁区域の管理で誤りは？", "choices": ["標識設置", "周知徹底", "加熱作業の許可制", "喫煙所を内部に設置"], "answer": 4},
-    {"question": "油火災時の初期消火で不適切なのは？", "choices": ["水散布", "泡消火器", "粉末消火器", "蓋をする"], "answer": 1},
-    {"question": "貯蔵庫の照明で望ましいのは？", "choices": ["防爆仕様", "白熱裸電球", "ろうそく", "携帯ストーブ"], "answer": 1},
-    {"question": "危険物施設での携帯電話使用で注意すべきは？", "choices": ["基本的に全面許可", "着火源となる可能性", "安全向上のみ", "影響なし"], "answer": 2},
-    {"question": "容器のアース（接地）の目的は？", "choices": ["美観", "静電気の放電・着火防止", "重量測定", "冷却"], "answer": 2},
-    {"question": "引火点が最も高いのはどれ？", "choices": ["ガソリン", "灯油", "軽油", "重油"], "answer": 4},
-    {"question": "危険物の運搬で必要なのは？", "choices": ["運転免許のみ", "積載量・表示・書類等の遵守", "制服", "助手2名"], "answer": 2},
-    {"question": "アルコール類の指定数量は？", "choices": ["100L", "200L", "400L", "600L"], "answer": 3},
-    {"question": "静電気が発生しやすい操作は？", "choices": ["静置", "急速注入や濾過", "冷却", "加温のみ"], "answer": 2},
-    {"question": "蒸気比重が空気より重い可燃蒸気の挙動は？", "choices": ["上へ拡散", "その場で消える", "低所へ滞留・流動", "影響なし"], "answer": 3},
-    {"question": "『危険等級Ⅱ』に該当するのは一般に？", "choices": ["第1石油類", "第2石油類など", "第3石油類", "第4石油類"], "answer": 2},
-    {"question": "灯油のおおよその引火点は？", "choices": ["−20℃", "0〜−10℃", "約40℃前後", "約100℃"], "answer": 3},
-    {"question": "危険物取扱者（乙4）が現場で担う役割は？", "choices": ["販売のみ", "安全管理・取扱い監督など", "会計のみ", "搬入のみ"], "answer": 2},
+# ===== ユーザー状態（セッション管理）=====
+# user_state[user_id] = { "qid": int|None, "answer": int|None, "count": int, "correct": int, "target": int }
+user_state: Dict[str, Dict[str, Any]] = {}
+DEFAULT_SESSION_LEN = 50
+
+def get_or_init_state(user_id: str) -> Dict[str, Any]:
+    st = user_state.get(user_id)
+    if not st:
+        st = {"qid": None, "answer": None, "count": 0, "correct": 0, "target": DEFAULT_SESSION_LEN}
+        user_state[user_id] = st
+    return st
+
+def reset_session(user_id: str):
+    user_state[user_id] = {"qid": None, "answer": None, "count": 0, "correct": 0, "target": DEFAULT_SESSION_LEN}
+
+# ===== 乙4 過去問系50問（オリジナル表現）=====
+# answer は 1〜4（①〜④）
+Q = [
+    # 分類・指定数量
+    {"question":"第4類危険物の共通性質は？","choices":["引火性液体","酸化性固体","自然発火性","可燃性固体"],"answer":1},
+    {"question":"ガソリンの分類・指定数量は？","choices":["第1石油類・非水溶性・200L","第1石油類・水溶性・400L","第2石油類・非水溶性・1000L","第3石油類・非水溶性・2000L"],"answer":1},
+    {"question":"アセトンの指定数量は？（水溶性第1石油類）","choices":["200L","400L","1000L","50L"],"answer":2},
+    {"question":"灯油の指定数量は？（第2石油類・非水溶）","choices":["200L","400L","1000L","2000L"],"answer":3},
+    {"question":"軽油の指定数量は？（第3石油類・非水溶）","choices":["1000L","2000L","4000L","6000L"],"answer":2},
+    {"question":"重油の分類・指定数量は？","choices":["第3石油類・2000L","第4石油類・6000L","第2石油類・1000L","第1石油類・200L"],"answer":2},
+    {"question":"アルコール類（エタノール等）の指定数量は？","choices":["200L","400L","1000L","2000L"],"answer":2},
+    {"question":"第2石油類（水溶性）の指定数量は？","choices":["1000L","2000L","4000L","6000L"],"answer":2},
+    {"question":"第3石油類（水溶性）の指定数量は？","choices":["2000L","4000L","6000L","1000L"],"answer":2},
+    {"question":"特殊引火物の指定数量は？","choices":["200L","400L","50L","6000L"],"answer":3},
+
+    # 引火点・性状
+    {"question":"第1石油類の引火点は？","choices":["21℃未満","21〜70℃未満","70〜200℃未満","200℃以上"],"answer":1},
+    {"question":"第2石油類の引火点は概ね？","choices":["21℃未満","約21〜70℃未満","約70〜200℃未満","200℃以上"],"answer":2},
+    {"question":"第3石油類の引火点は？","choices":["21℃未満","21〜70℃未満","70〜200℃未満","200℃以上"],"answer":3},
+    {"question":"第4石油類の引火点は？","choices":["21℃未満","70〜200℃未満","200℃以上","0℃未満"],"answer":3},
+    {"question":"ガソリン蒸気の挙動で正しいのは？","choices":["空気より軽く上昇","空気より重く低所に滞留","空気と同じで拡散","比重は関係ない"],"answer":2},
+    {"question":"灯油の性質で正しいのは？","choices":["ガソリンより引火点が高い","水に混和しやすい","第1石油類に分類","蒸気は空気より軽い"],"answer":1},
+    {"question":"メタノールの注意点は？","choices":["強い吸入毒性の懸念","静電気の心配は不要","水に混和しない","油火災用泡が効かない"],"answer":1},
+    {"question":"可燃性蒸気は一般に…","choices":["高所にたまる","低所・ピットにたまる","どこにも滞留しない","必ず屋外に散逸する"],"answer":2},
+    {"question":"ベンゼンの分類は？","choices":["第1石油類・非水溶性","第1石油類・水溶性","第2石油類・非水溶性","アルコール類"],"answer":1},
+    {"question":"イソプロパノール（IPA）の分類は？","choices":["第1石油類","アルコール類","第2石油類","第3石油類"],"answer":2},
+
+    # 消火・設備
+    {"question":"油火災に最適な消火は？","choices":["大量放水","泡消火","砂は不可","二酸化炭素は常に不可"],"answer":2},
+    {"question":"ガソリン火災に不適切なのは？","choices":["泡","粉末","大量の放水","二酸化炭素"],"answer":3},
+    {"question":"静電気対策として適切なのは？","choices":["接地（アース）","注入は極端に速く","湿度は低いほど良い","非導電ホース使用"],"answer":1},
+    {"question":"防油堤の目的は？","choices":["換気","漏えい拡大防止","冷却","装飾"],"answer":2},
+    {"question":"屋内照明で望ましいのは？","choices":["防爆仕様","白熱裸電球","ろうそく","可搬ストーブ"],"answer":1},
+    {"question":"容器表示で必要なのは？","choices":["内容物名・危険等級等","会社名のみ","容量のみ","製造年月日のみ"],"answer":1},
+    {"question":"第4類共通の主危険は？","choices":["酸化性","腐食性","引火性","窒息性"],"answer":3},
+    {"question":"指定数量以上で必要なのは？","choices":["特になし","許可","口頭連絡","写真保存"],"answer":2},
+    {"question":"『少量危険物』の概念に近いのは？","choices":["指定数量の5分の1未満","指定数量の2倍","無制限","第1石油類のみ対象"],"answer":1},
+    {"question":"危険物帳簿に必要なのは？","choices":["色・匂い","数量・品名・入出庫","写真のみ","不要"],"answer":2},
+
+    # 運搬・取扱
+    {"question":"運搬時に必要なのは？","choices":["積載量遵守・表示・書類等","制服","助手2名","音楽"],"answer":1},
+    {"question":"タンク注入で不適切なのは？","choices":["注入速度を上げ続ける","アースを取る","導電性ホース使用","飛散防止"],"answer":1},
+    {"question":"混載禁止の理由は？","choices":["重量超過","反応・危険増大","税制","臭気"],"answer":2},
+    {"question":"換気で重要なのは？","choices":["給気のみ","排気のみ","給気・排気のバランス","換気不要"],"answer":3},
+    {"question":"静電気が発生しやすい操作は？","choices":["静置","急速注入や濾過","冷却","加温のみ"],"answer":2},
+    {"question":"容器接地（アース）の目的は？","choices":["美観","静電気放電","重量測定","冷却"],"answer":2},
+    {"question":"携帯電話の注意点は？","choices":["常時安全","着火源になり得る","消火器の代用可","影響なし"],"answer":2},
+    {"question":"漏えい時にまず優先するのは？","choices":["SNS報告","着火源除去・拡大防止","写真撮影","臭気対策"],"answer":2},
+    {"question":"保安容器の目的は？","choices":["装飾","飛散・揮発抑制と安全注ぎ","重量増","保温"],"answer":2},
+    {"question":"可燃蒸気の比重が空気より大きいと…","choices":["上昇散逸","低所へ流下・滞留","常に無害","気圧のみ依存"],"answer":2},
+
+    # 物理化学
+    {"question":"沸点が低いほど一般に…","choices":["揮発しにくい","揮発しやすい","引火しにくい","危険性は下がる"],"answer":2},
+    {"question":"ガソリンは水に…","choices":["混和しやすい","ほとんど混和しない","完全溶解","必ず沈む"],"answer":2},
+    {"question":"アルコール類は水に…","choices":["混和しにくい","ほとんど混和しない","混和しやすい","浮く"],"answer":3},
+    {"question":"'引火点'の定義は？","choices":["自然発火温度","外火で燃え出す最低温度","沸点","凝固点"],"answer":2},
+    {"question":"'発火点'の定義は？","choices":["外火なしで自然に燃える温度","外火で燃える温度","引火点と同じ","凝固点"],"answer":1},
+    {"question":"可燃限界で正しいのは？","choices":["濃すぎても薄すぎても燃えない範囲がある","濃いほど必ず燃える","薄いほど必ず燃える","限界はない"],"answer":1},
+    {"question":"蒸気雰囲気で爆発を起こしやすい条件は？","choices":["可燃限界内","可燃限界外（濃すぎ）","可燃限界外（薄すぎ）","常に同じ"],"answer":1},
+    {"question":"静電気着火を抑える方法は？","choices":["乾燥させる","導電路と接地を設ける","保温する","攪拌を激しくする"],"answer":2},
+    {"question":"水溶性第1石油類の例は？","choices":["アセトン","ベンゼン","トルエン","キシレン"],"answer":1},
+    {"question":"第3石油類（水溶性）の例は？","choices":["クレオソート油","エチレングリコール","ギヤオイル","タービン油"],"answer":2},
+
+    # 法令・管理
+    {"question":"指定数量以上の貯蔵・取扱いで必要なのは？","choices":["許可","届出不要","口頭報告","自主判断"],"answer":1},
+    {"question":"危険物施設の定期点検の主目的は？","choices":["見栄え向上","事故防止","生産性向上","費用削減"],"answer":2},
+    {"question":"標識『火気厳禁』で不適切なのは？","choices":["標識設置","周知徹底","内部に喫煙所設置","加熱作業の許可制"],"answer":3},
+    {"question":"屋内貯蔵所の換気で重要なのは？","choices":["給気のみ","排気のみ","給気・排気のバランス","換気不要"],"answer":3},
+    {"question":"危険物保安監督者の選任義務の典型は？","choices":["合計倍数150以上など","常に必要","研究室でも必須","少量でも必須"],"answer":1},
+    {"question":"危険物容器の材質として望ましいのは？","choices":["金属容器","薄肉ポリエチレンのみ","紙容器","木容器"],"answer":1},
+    {"question":"出火時の初動として適切なのは？","choices":["状況把握→通報→初期消火","SNS投稿","写真撮影優先","放水のみ"],"answer":1},
+    {"question":"ガソリン火災への水の散布が不適な理由は？","choices":["反応するため","油の浮上拡散を助長","泡が発生しないため","二酸化炭素が発生するため"],"answer":2},
+    {"question":"指定数量倍数が増えると一般に必要なのは？","choices":["安全対策の強化","標識縮小","緩和措置","変化なし"],"answer":1},
+    {"question":"『屋内タンクの換気』で重要なのは？","choices":["排気のみ","遮光のみ","給気・排気のバランス","冷却のみ"],"answer":3},
 ]
 
-# ===== 出題 =====
-def make_quiz() -> Dict[str, Any]:
-    q = random.choice(questions)
+# ===== ユーティリティ =====
+def normalize_choice(s: str) -> int | None:
+    s = s.strip()
+    m = {"①":"1","②":"2","③":"3","④":"4","１":"1","２":"2","３":"3","４":"4"}
+    s = m.get(s, s)
+    return int(s) if s in ("1","2","3","4") else None
+
+def make_question():
+    qid = random.randrange(len(Q))
+    q = Q[qid]
     text = (
-        f"Q: {q['question']}\n"
+        f"Q{st_placeholder}: {q['question']}\n"
         f"① {q['choices'][0]}\n"
         f"② {q['choices'][1]}\n"
         f"③ {q['choices'][2]}\n"
         f"④ {q['choices'][3]}"
     )
-    return {"text": text, "answer": q["answer"]}
+    return qid, text, q["choices"], q["answer"]
 
 def send_quiz(user_id: str, reply_token: str):
-    quiz = make_quiz()
-    # 答えを記録
-    user_state[user_id] = {"answer": quiz["answer"]}
+    st = get_or_init_state(user_id)
+    qid = random.randrange(len(Q))
+    q = Q[qid]
+    st["qid"] = qid
+    st["answer"] = q["answer"]
+    text = (
+        f"Q{st['count']+1}/{st['target']}: {q['question']}\n"
+        f"① {q['choices'][0]}\n"
+        f"② {q['choices'][1]}\n"
+        f"③ {q['choices'][2]}\n"
+        f"④ {q['choices'][3]}"
+    )
     line_bot_api.reply_message(
         reply_token,
-        TextSendMessage(text=quiz["text"], quick_reply=qr_choices())
+        TextSendMessage(text=text, quick_reply=qr_choices(q["choices"]))
     )
 
-def judge_answer(user_id: str, reply_token: str, ans_text: str):
-    if user_id not in user_state or "answer" not in user_state[user_id]:
+def judge_and_reply(user_id: str, reply_token: str, user_input: str):
+    st = get_or_init_state(user_id)
+    if st.get("answer") is None:
         line_bot_api.reply_message(
             reply_token,
-            TextSendMessage(text="先に「問題」と送ってください。", quick_reply=qr_next())
+            TextSendMessage(text="先に『問題』または『次の問題』で出題してね。", quick_reply=qr_menu())
         )
         return
-    correct = user_state[user_id]["answer"]
-    # ①②③④ or 1/2/3/4 に対応
-    mapping = {"①":1,"②":2,"③":3,"④":4,"1":1,"2":2,"3":3,"4":4}
-    user_ans = mapping.get(ans_text.strip(), None)
-    if user_ans is None:
-        line_bot_api.reply_message(reply_token, TextSendMessage(text="①〜④で答えてください。", quick_reply=qr_choices()))
+
+    chosen = normalize_choice(user_input)
+    if chosen is None:
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text="①〜④で答えてね。", quick_reply=qr_menu())
+        )
         return
-    if user_ans == correct:
-        msg = "⭘ 正解！"
-    else:
-        msg = f"✕ 不正解… 正解は {['①','②','③','④'][correct-1]} でした。"
-    # 次の問題へ誘導
+
+    # 採点
+    correct_flag = (chosen == st["answer"])
+    save_result(user_id, st["qid"], correct_flag)
+    st["count"] += 1
+    if correct_flag:
+        st["correct"] += 1
+
+    # メッセージ
+    marks = ["①","②","③","④"]
+    q = Q[st["qid"]]
+    base = "⭕ 正解！" if correct_flag else f"❌ 不正解… 正解は {marks[q['answer']-1]}『{q['choices'][q['answer']-1]}』"
+
+    # 10問ごと or 最終で途中成績/最終成績
+    summary = ""
+    if st["count"] % 10 == 0 or st["count"] >= st["target"]:
+        rate = round(st["correct"] / st["count"] * 100, 1)
+        summary = f"\n— 途中成績 —\n{st['count']}/{st['target']}問中：{st['correct']}問 正解（{rate}%）"
+    if st["count"] >= st["target"]:
+        final_rate = round(st["correct"] / st["target"] * 100, 1)
+        summary += f"\n\n✅ 最終成績：{st['correct']}/{st['target']}問 正解（{final_rate}%）\nセッションはリセットしました。"
+        reset_session(user_id)
+        line_bot_api.reply_message(
+            reply_token,
+            TextSendMessage(text=base + summary, quick_reply=qr_menu())
+        )
+        return
+
     line_bot_api.reply_message(
         reply_token,
-        TextSendMessage(text=msg, quick_reply=qr_next())
+        TextSendMessage(text=base + summary, quick_reply=qr_menu())
     )
-    # 一旦答えは消して次の問題要求へ
-    user_state.pop(user_id, None)
+    # 次の出題に備えて答えだけクリア
+    st["qid"] = None
+    st["answer"] = None
 
-# ===== LINE Webhook =====
+# ===== health =====
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ===== webhook =====
 @app.post("/callback")
 async def callback(request: Request):
     signature = request.headers.get("X-Line-Signature", "")
@@ -195,42 +273,50 @@ async def callback(request: Request):
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     for event in events:
-        if not isinstance(event, MessageEvent):
-            continue
-        if not isinstance(event.message, TextMessage):
-            continue
+        if not isinstance(event, MessageEvent): continue
+        if not isinstance(event.message, TextMessage): continue
 
         user_id = event.source.user_id
         text = event.message.text.strip()
 
-        # --- 天気 ---
-        if text.endswith("の天気"):
-            city = text.replace("の天気", "").strip()
-            reply = fetch_weather(city)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply, quick_reply=qr_next()))
-            continue
-        if text.startswith("天気 "):
-            city = text.split(" ", 1)[1].strip() if " " in text else ""
-            reply = fetch_weather(city or "名古屋")
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply, quick_reply=qr_next()))
+        if text in ("問題","次の問題","クイズ","quiz"):
+            send_quiz(user_id, event.reply_token); continue
+
+        if text in ("ステータス","状態","進捗"):
+            st = get_or_init_state(user_id)
+            if st["count"] == 0:
+                msg = f"まだ未回答。目標 {st['target']}問。『問題』で開始！"
+            else:
+                rate = round(st["correct"]/st["count"]*100,1)
+                msg = f"途中成績：{st['count']}/{st['target']}問中 {st['correct']}問 正解（{rate}%）"
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=msg, quick_reply=qr_menu()))
             continue
 
-        # --- クイズ ---
-        if text in ("問題", "次の問題"):
-            send_quiz(user_id, event.reply_token)
-            continue
-        if text in ("①","②","③","④","1","2","3","4"):
-            judge_answer(user_id, event.reply_token, text)
+        if text in ("リセット","セッションリセット"):
+            reset_session(user_id)
+            line_bot_api.reply_message(event.reply_token,
+                TextSendMessage(text="セッションをリセットしました。『問題』で再開できます。", quick_reply=qr_menu()))
             continue
 
-        if text == "ヘルプ":
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=HELP_TEXT, quick_reply=qr_next()))
+        if text in ("成績確認","成績","スコア"):
+            total, ok, rate = get_stats(user_id)
+            line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"累積成績：{ok}/{total}問 正解（{rate}%）", quick_reply=qr_menu())
+            )
             continue
 
-        # デフォルトの案内
+        if text in ("ヘルプ","使い方","help"):
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=HELP_TEXT, quick_reply=qr_menu()))
+            continue
+
+        if normalize_choice(text) is not None:
+            judge_and_reply(user_id, event.reply_token, text)
+            continue
+
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text="「問題」「①〜④で回答」「次の問題」/「◯◯の天気」または「天気 ◯◯」で使えます。", quick_reply=qr_next())
+            TextSendMessage(text="『問題』『次の問題』『①〜④で回答』『ステータス』『成績確認』『リセット』が使えます。", quick_reply=qr_menu())
         )
 
-    return JSONResponse({"status": "ok"})
+    return JSONResponse({"status":"ok"})
