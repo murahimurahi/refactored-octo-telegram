@@ -87,3 +87,6 @@ async def callback(request: Request):
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
 
     return JSONResponse({"ok": True})
+@app.get("/health")
+def health():
+    return {"status": "ok"}
