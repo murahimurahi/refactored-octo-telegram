@@ -1,92 +1,158 @@
-import os, requests, re
-from fastapi import FastAPI, Request, HTTPException
+import os
+import random
+import requests
+from typing import Dict
+
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from linebot import LineBotApi, WebhookParser
+
+from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import (
+    MessageEvent, TextMessage, TextSendMessage,
+    QuickReply, QuickReplyButton, MessageAction
+)
 
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-WEATHER_KEY = os.getenv("OPENWEATHER_API_KEY")
+# ====== 環境変数 ======
+LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
+LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
+OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
 
-if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
-    raise RuntimeError("LINEの環境変数が足りません。")
+line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
-parser = WebhookParser(CHANNEL_SECRET)
 app = FastAPI()
 
+# ====== ヘルスチェック ======
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
-# 日本の主要都市だけ簡易対応（必要なら増やす）
-CITY_MAP = {
-    "名古屋": "Nagoya",
-    "東京": "Tokyo",
-    "大阪": "Osaka",
-    "札幌": "Sapporo",
-    "福岡": "Fukuoka",
-    "京都": "Kyoto",
-    "横浜": "Yokohama",
-    "仙台": "Sendai",
-}
+# ====== 乙4クイズ（ランダム4択） ======
+# answer は 0〜3（①〜④）
+QUIZ_BANK = [
+    {
+        "q": "ガソリン（第4類第1石油類）の指定数量は？",
+        "choices": ["① 100L", "② 200L", "③ 400L", "④ 1000L"],
+        "answer": 0
+    },
+    {
+        "q": "灯油（第4類第2石油類）の指定数量は？",
+        "choices": ["① 100L", "② 200L", "③ 1000L", "④ 2000L"],
+        "answer": 2
+    },
+    {
+        "q": "軽油（第4類第2石油類）の指定数量は？",
+        "choices": ["① 200L", "② 400L", "③ 800L", "④ 1000L"],
+        "answer": 3
+    },
+    {
+        "q": "アセトン（第4類第1石油類）の指定数量は？",
+        "choices": ["① 100L", "② 200L", "③ 400L", "④ 800L"],
+        "answer": 0
+    },
+    {
+        "q": "危険物の貯蔵・取扱いで誤っているものは？",
+        "choices": ["① 指定数量以上は許可が必要", "② 指定数量未満なら全て規制なし",
+                    "③ 指定数量の倍数で“倍数”と表す", "④ 少量でも安全対策が必要"],
+        "answer": 1
+    },
+]
 
-def resolve_city(text: str) -> str:
-    # 「○○の天気」「○○ 天気」などから都市名を抜く
-    m = re.search(r"(.+?)\s*の?\s*天気", text)
-    if m:
-        jp = m.group(1).strip()
-        if jp in CITY_MAP:
-            return CITY_MAP[jp]
-        # そのまま英語都市名と仮定
-        return jp
-    # 単に「天気」だけなら名古屋をデフォルト
-    return CITY_MAP["名古屋"]
+# ユーザーごとの出題保持（簡易・揮発）
+USER_STATE: Dict[str, Dict] = {}
 
-def get_weather(city_en: str) -> str:
-    if not WEATHER_KEY:
+LABELS = ["①", "②", "③", "④"]
+
+def pick_question(user_id: str) -> Dict:
+    q = random.choice(QUIZ_BANK)
+    USER_STATE[user_id] = q
+    return q
+
+def quick_reply_for_choices() -> QuickReply:
+    # ボタンを ①〜④ で返す（押すと “①/②/③/④” がそのままテキストになる）
+    items = [QuickReplyButton(action=MessageAction(label=lab, text=lab)) for lab in LABELS]
+    return QuickReply(items=items)
+
+# ====== お天気（既存の簡易版） ======
+def fetch_weather(city: str) -> str:
+    if not OPENWEATHER_API_KEY:
         return "天気APIキーが未設定です（OPENWEATHER_API_KEY）。"
-    url = (
-        "https://api.openweathermap.org/data/2.5/weather"
-        f"?q={city_en},JP&appid={WEATHER_KEY}&lang=ja&units=metric"
-    )
     try:
-        r = requests.get(url, timeout=8)
-        if r.status_code == 200:
-            data = r.json()
-            desc = data["weather"][0]["description"]
-            temp = round(data["main"]["temp"], 1)
-            name = data.get("name", city_en)
-            return f"{name}の天気: {desc} / 気温: {temp}℃"
-        else:
-            return "天気情報を取得できませんでした。"
-    except requests.RequestException:
-        return "天気APIへの接続に失敗しました。"
+        url = "https://api.openweathermap.org/data/2.5/weather"
+        params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric", "lang": "ja"}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        desc = data["weather"][0]["description"]
+        temp = data["main"]["temp"]
+        return f"{city}の天気: {desc} / 気温: {temp:.1f}℃"
+    except Exception:
+        return f"{city}の天気が取得できませんでした。都市名を変えて試してみてください。"
 
+# ====== LINE コールバック ======
 @app.post("/callback")
 async def callback(request: Request):
-    signature = request.headers.get("x-line-signature")
+    signature = request.headers.get("X-Line-Signature", "")
     body = await request.body()
-    if not signature:
-        raise HTTPException(status_code=400, detail="Missing signature")
-
     try:
-        events = parser.parse(body.decode("utf-8"), signature)
+        handler.handle(body.decode("utf-8"), signature)
     except InvalidSignatureError:
-        raise HTTPException(status_code=401, detail="Invalid signature")
+        return JSONResponse(status_code=400, content={"message": "Invalid signature"})
+    return JSONResponse(status_code=200, content={"message": "OK"})
 
-    for event in events:
-        if isinstance(event, MessageEvent) and isinstance(event.message, TextMessage):
-            text = event.message.text.strip()
-            if "天気" in text:
-                city = resolve_city(text)
-                reply = get_weather(city)
-            else:
-                reply = "「○○の天気」と送ると天気を返します。例: 名古屋の天気"
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+@handler.add(MessageEvent, message=TextMessage)
+def on_message(event: MessageEvent):
+    user_id = event.source.user_id
+    text = event.message.text.strip()
 
-    return JSONResponse({"ok": True})
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+    # ---- クイズの起動ワード ----
+    if text in ["問題", "クイズ", "次", "次の問題"]:
+        q = pick_question(user_id)
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=q["q"] + "\n" + "\n".join(q["choices"]),
+                            quick_reply=quick_reply_for_choices())
+        )
+        return
+
+    # ---- 回答（①②③④）----
+    if text in LABELS and user_id in USER_STATE:
+        q = USER_STATE[user_id]
+        selected_index = LABELS.index(text)
+        correct_index = q["answer"]
+        if selected_index == correct_index:
+            result = "⭕ 正解！"
+        else:
+            result = f"❌ 不正解。正解は {LABELS[correct_index]}（{q['choices'][correct_index]}）です。"
+        # 次の問題ボタン
+        next_btn = QuickReply(items=[
+            QuickReplyButton(action=MessageAction(label="次の問題", text="次の問題"))
+        ])
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=result, quick_reply=next_btn)
+        )
+        return
+
+    # ---- 天気：『◯◯の天気』/『天気 ◯◯』----
+    if text.endswith("の天気"):
+        city = text.replace("の天気", "").strip()
+        reply = fetch_weather(city)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+    if text.startswith("天気 "):
+        city = text.split(" ", 1)[1].strip()
+        reply = fetch_weather(city)
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+        return
+
+    # ---- ヘルプ ----
+    help_msg = (
+        "使い方:\n"
+        "・「問題」/「クイズ」→ 乙4の4択問題を出題\n"
+        "・「①/②/③/④」→ 回答ボタン\n"
+        "・「次の問題」→ さらに出題\n"
+        "・「名古屋の天気」/「天気 東京」→ 天気表示"
+    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_msg))
