@@ -1,275 +1,381 @@
+# -*- coding: utf-8 -*-
+# ===== FastAPI + LINE Bot 乙4クイズ（50問・25/50総括・紙吹雪演出）=====
+
 import os
-from flask import Flask, request, abort, Response
-from linebot import LineBotApi, WebhookHandler
+import random
+from typing import Dict, Any
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+
+from linebot import LineBotApi, WebhookParser
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import (
-    MessageEvent, TextMessage, TextSendMessage, FlexSendMessage,
-    QuickReply, QuickReplyButton, MessageAction, URIAction
+    MessageEvent, TextMessage, TextSendMessage,
+    QuickReply, QuickReplyButton, MessageAction
 )
 
-app = Flask(__name__)
+# ---- FastAPI App
+app = FastAPI()
 
-# ---- LINE Secrets ----
-LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
-LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+# ---- 環境変数（Render の Env に設定）
+CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 
-# ---- In-memory session (簡易) ----
-sessions = {}  # {user_id: {"index": int, "score": int, "answered": int}}
+if not CHANNEL_ACCESS_TOKEN or not CHANNEL_SECRET:
+    print("!!! LINE env is missing: set LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET")
 
-def sess(user_id):
-    if user_id not in sessions:
-        sessions[user_id] = {"index": 0, "score": 0, "answered": 0}
-    return sessions[user_id]
+line_bot_api = LineBotApi(CHANNEL_ACCESS_TOKEN)
+parser = WebhookParser(CHANNEL_SECRET)
 
-# ---- 乙4 過去問風 50問（数字を避けた概念中心・誤りにくい内容）----
-# ans は 1~4 の整数
-questions = [
-    {"q": "引火点とは？", "choices": ["自然に燃え出す温度", "火源があれば燃える最も低い温度", "沸騰を始める温度", "燃焼が継続する温度"], "ans": 2, "exp": "引火点は火源があると蒸気に着火する最低温度。"},
-    {"q": "発火点とは？", "choices": ["自然に燃え出す最低温度", "鍋が熱くなる温度", "液体が沸騰する温度", "固体が溶ける温度"], "ans": 1, "exp": "外部火源なしで自然に発火する最低温度。"},
-    {"q": "可燃性蒸気は空気より重いことが多く、何にたまりやすい？", "choices": ["高い場所", "低い場所", "どこにもたまらない", "水面上"], "ans": 2, "exp": "多くの可燃性蒸気は比重が空気より大きく低所へ滞留。"},
-    {"q": "静電気による火花放電を防ぐ基本は？", "choices": ["換気を止める", "接地・等電位化", "加熱する", "湿度を下げる"], "ans": 2, "exp": "接地・等電位化と湿度管理が有効。"},
-    {"q": "第4類危険物の共通性質は？", "choices": ["酸化性が強い", "可燃性の液体", "毒性が強い", "腐食性のみ"], "ans": 2, "exp": "乙4は『可燃性液体』を扱う資格。"},
-    {"q": "燃焼の三要素は？", "choices": ["熱・酸素・可燃物", "熱・窒素・可燃物", "光・酸素・水", "電気・水・風"], "ans": 1, "exp": "熱源・酸素供給・可燃物が必要。"},
-    {"q": "水で消火してはいけないのは？", "choices": ["油火災", "紙の火災", "木材の火災", "布の火災"], "ans": 1, "exp": "油は水に浮き飛散し拡大する。"},
-    {"q": "泡消火薬剤の主目的は？", "choices": ["酸素供給", "冷却", "窒息・遮断と冷却", "加熱"], "ans": 3, "exp": "表面に膜や泡層を作り窒息＋冷却。"},
-    {"q": "金属ナトリウムに適さない消火剤は？", "choices": ["乾燥砂", "粉末", "水", "金属火災用粉末"], "ans": 3, "exp": "水と激しく反応し危険。"},
-    {"q": "蒸気圧が高い液体は一般に？", "choices": ["気化しにくい", "気化しやすい", "引火しない", "沸点が必ず高い"], "ans": 2, "exp": "蒸気圧が高いほど蒸発しやすい。"},
-    {"q": "換気の目的で正しいのは？", "choices": ["蒸気濃度を上げる", "蒸気を希釈・排出する", "温度を上げる", "静電気を発生させる"], "ans": 2, "exp": "発生蒸気を希釈排出し爆発限界未満へ。"},
-    {"q": "危険物標識『火気厳禁』の色は？", "choices": ["青地白字", "赤地白字", "緑地白字", "黄地黒字"], "ans": 2, "exp": "赤地白字が一般的。"},
-    {"q": "危険物の類別表示で『第4類』の色は？", "choices": ["青", "赤", "黄", "緑"], "ans": 1, "exp": "類別標識は第1類：黄、第2：黄、第3：青、第4：青 など自治体様式に準ず。"},
-    {"q": "引火点が低いほど？", "choices": ["危険性は低い", "危険性は高い", "変わらない", "燃えない"], "ans": 2, "exp": "低温でも着火しやすく危険性が高い。"},
-    {"q": "指定数量の意義は？", "choices": ["最大保管可能量", "法規制強化の境界量", "販売価格", "比重"], "ans": 2, "exp": "指定数量以上は許可・設備が必要。"},
-    {"q": "危険物の貯蔵所で容器に求められるのは？", "choices": ["強度・気密・表示", "透明で軽いこと", "金属製のみ", "紙製のみ"], "ans": 1, "exp": "内容物適合の材質・強度・表示が必要。"},
-    {"q": "屋内貯蔵所で原則必要な設備は？", "choices": ["加熱炉", "換気設備・消火設備", "冷蔵庫のみ", "飾り棚"], "ans": 2, "exp": "自然換気/機械換気や消火設備が必要。"},
-    {"q": "危険物の運搬で注意すべきは？", "choices": ["容器の転倒防止", "密栓しない", "ラベル除去", "日光に当てる"], "ans": 1, "exp": "堅固に固定し密栓・表示を保持。"},
-    {"q": "作業前の静電気対策で有効なのは？", "choices": ["合成繊維の着用", "導電靴・接地", "乾燥環境", "ビニール手袋"], "ans": 2, "exp": "導電性の履物・床・接地が基本。"},
-    {"q": "油吸着材の処理で正しいのは？", "choices": ["排水へ流す", "可燃ごみ", "危険物として適正処理", "乾燥させて放置"], "ans": 3, "exp": "汚染物も危険物に準じ管理。"},
-    # 20
-    {"q": "蒸気はどこに滞留しやすい？", "choices": ["天井付近", "床付近", "窓付近", "屋外のみ"], "ans": 2, "exp": "比重が大きい蒸気は低所に滞留。"},
-    {"q": "漏えい時の第一行動は？", "choices": ["スマホ撮影", "喫煙", "着火源排除と換気・避難", "加熱"], "ans": 3, "exp": "着火源除去・排気・安全確保が最優先。"},
-    {"q": "金属容器の液面計測で安全なのは？", "choices": ["裸電球を入れる", "鉄棒で撹拌", "導電性のあるアース済み計器", "火を近づける"], "ans": 3, "exp": "静電火花を防ぐ。"},
-    {"q": "可燃性蒸気の爆発下限界より下の濃度では？", "choices": ["燃焼しない", "常に爆発する", "必ず自然発火", "色が変わる"], "ans": 1, "exp": "下限界未満では可燃範囲外。"},
-    {"q": "容器ラベルの基本情報は？", "choices": ["製造者の趣味", "内容物名・危険区分・注意", "価格のみ", "QRのみ"], "ans": 2, "exp": "内容物/類項/注意/連絡先など。"},
-    {"q": "火災四分類で油火災は？", "choices": ["A(普通)", "B(油)", "C(電気)", "D(金属)"], "ans": 2, "exp": "油火災はB火災。"},
-    {"q": "電気火災への水噴霧は？", "choices": ["感電の恐れ", "安全", "推奨", "必須"], "ans": 1, "exp": "感電・短絡の恐れ。電源遮断を優先。"},
-    {"q": "換気扇のスイッチ操作は漏えい時に？", "choices": ["火花の恐れに注意", "必ず入れる", "必ず切る", "関係ない"], "ans": 1, "exp": "防爆でないスイッチ操作は火花要注意。"},
-    {"q": "防爆構造機器の目的は？", "choices": ["耐震", "着火源抑止", "防水", "遮音"], "ans": 2, "exp": "爆発性雰囲気での着火源抑制。"},
-    {"q": "皮膚に溶剤が付いたら？", "choices": ["乾くまで放置", "火であぶる", "大量の水で洗う", "布でこする"], "ans": 3, "exp": "流水で速やかに洗浄。"},
-    # 30
-    {"q": "可燃液体の保管温度で望ましいのは？", "choices": ["高温", "直射日光", "常温・低温で安定", "加熱保持"], "ans": 3, "exp": "温度上昇は蒸気増加＝危険。"},
-    {"q": "容器のアース線は？", "choices": ["飾り", "等電位結合に必要", "不要", "絶縁すべき"], "ans": 2, "exp": "容器・配管・機器を等電位化。"},
-    {"q": "開放系での液移送中に危険な行為は？", "choices": ["接地", "金属同士の接触維持", "ポリ容器を空中で注ぐ", "静かに注ぐ"], "ans": 3, "exp": "空中注ぎは帯電・飛散を招く。"},
-    {"q": "油の自然発火を招くのは？", "choices": ["酸素不足", "含浸したウエスの放置", "冷凍保存", "水濡れ"], "ans": 2, "exp": "乾性油を含んだ布の山は危険。"},
-    {"q": "アルコール類の特徴は？", "choices": ["水に溶けない", "水に溶けやすいものが多い", "固体が多い", "可燃性がない"], "ans": 2, "exp": "多くは水混和性で可燃。"},
-    {"q": "消防法で『屋外タンク貯蔵所』の利点は？", "choices": ["近隣影響大", "自然換気しやすい", "屋内より蒸気がこもる", "雨水で満たす"], "ans": 2, "exp": "開放空間で蒸気滞留しにくい。"},
-    {"q": "少量危険物の扱いは？", "choices": ["規制が全くない", "都道府県条例で基準あり", "自由に野積み", "名称表示不要"], "ans": 2, "exp": "条例に基づく基準が定められる。"},
-    {"q": "移送ポンプ停止時の手順は？", "choices": ["電源OFFのみ", "吸込管開放", "バルブ閉＆電源OFF", "開放して放置"], "ans": 3, "exp": "バルブ閉止・電源遮断など安全操作。"},
-    {"q": "油類の比重は一般に？", "choices": ["水より重い", "水と同じ", "水より軽いものが多い", "必ず気体"], "ans": 3, "exp": "多くは水より軽く水面に浮く。"},
-    {"q": "沸点が低い液体は？", "choices": ["蒸気が出にくい", "蒸気が出やすい", "可燃性がない", "固体化する"], "ans": 2, "exp": "気化しやすく注意。"},
-    # 40
-    {"q": "爆発上限界を超える高濃度では？", "choices": ["爆発しない場合がある", "必ず爆発", "燃えない", "青色になる"], "ans": 1, "exp": "濃すぎても酸素不足で燃えにくい。"},
-    {"q": "局所排気フードの目的は？", "choices": ["蒸気を捕集・排出", "加湿", "加熱", "点火"], "ans": 1, "exp": "発生源近傍で捕集し拡散防止。"},
-    {"q": "容器洗浄で避けるのは？", "choices": ["密閉空間での作業", "換気", "防護具", "表示残し"], "ans": 1, "exp": "酸欠・蒸気暴露の危険。"},
-    {"q": "安全データシート(SDS)の目的は？", "choices": ["価格交渉", "物性・危険性・応急措置等の情報提供", "広告", "在庫管理"], "ans": 2, "exp": "SDSで危険性や対策を共有。"},
-    {"q": "保護具で最優先は？", "choices": ["おしゃれ", "用途適合の選定", "サイズ自由", "使い捨て必須"], "ans": 2, "exp": "物質・作業に応じた適合が重要。"},
-    {"q": "雷注意報時の屋外移送は？", "choices": ["積極的に行う", "火花対策を強化・延期検討", "影響なし", "必ず中止"], "ans": 2, "exp": "誘導雷・静電気に注意。"},
-    {"q": "容器の保管姿勢で望ましいのは？", "choices": ["不安定でもOK", "転倒防止・直立", "常に横倒し", "蓋を緩める"], "ans": 2, "exp": "転倒防止・密栓・表示面外向き等。"},
-    {"q": "漏れの見つけ方で危険なのは？", "choices": ["泡立ち試験", "臭気の確認", "火を近づける", "検知器使用"], "ans": 3, "exp": "着火の恐れ。"},
-    {"q": "こぼれた油の初期対応は？", "choices": ["水で流す", "吸着材で囲い回収", "扇風機で飛ばす", "放置"], "ans": 2, "exp": "吸着・囲い込み・回収・適正処理。"},
-    {"q": "教育・訓練の目的は？", "choices": ["記念写真", "危険の理解と手順遵守", "懇親", "休暇取得"], "ans": 2, "exp": "手順理解と実行が事故防止に直結。"},
-    # 50
+# ---------------------------
+# 乙4クイズ 50問（q, choices, ans(1-4), exp）
+# できるだけ簡潔に。必要に応じて差し替えOK
+# ---------------------------
+QUIZ: list[Dict[str, Any]] = [
+    # 1
+    {"q":"第2石油類（水溶性）の指定数量は？",
+     "choices":["1000L","2000L","4000L","6000L"], "ans":2, "exp":"第2石油類（水溶性）は2000L。"},
+    {"q":"灯油（第4類第2石油類）の指定数量は？",
+     "choices":["100L","200L","1000L","2000L"], "ans":2, "exp":"灯油は第2石油類の非水溶性、指定数量200L。"},
+    {"q":"ガソリンの分類は？",
+     "choices":["第1石油類","第2石油類","第3石油類","第4石油類"], "ans":1, "exp":"ガソリンは第1石油類。指定数量200L。"},
+    {"q":"重油の分類は？",
+     "choices":["第1石油類","第2石油類","第3石油類","第4石油類"], "ans":3, "exp":"重油は第3石油類。指定数量2000L。"},
+    {"q":"アルコール類の指定数量は？",
+     "choices":["100L","200L","400L","600L"], "ans":3, "exp":"アルコール類（例：エタノール）は400L。"},
+    {"q":"引火点とは？",
+     "choices":["自然発火する温度","引火しやすさの指標","可燃性蒸気に着火して燃焼が継続する最低温度","燃焼熱の大きさ"], "ans":3, "exp":"燃焼が継続する最低温度。"},
+    {"q":"発火点とは？",
+     "choices":["自然発火する温度","水の沸点","凝固点","引火点より低い"], "ans":1, "exp":"外部着火なしで自然発火する温度。"},
+    {"q":"第1石油類の代表例は？",
+     "choices":["軽油","重油","ガソリン","灯油"], "ans":3, "exp":"ガソリンは第1石油類。"},
+    {"q":"危険物の性状で誤りは？",
+     "choices":["蒸気は空気より重い場合が多い","密閉室で滞留しやすい","低温でも絶対に蒸発しない","着火源があると爆発的に燃えることがある"], "ans":3, "exp":"低温でも蒸発はあり得る。"},
+    {"q":"静電気対策として適切なのは？",
+     "choices":["導電性ホース使用","接地","金属どうしの等電位化","いずれも適切"], "ans":4, "exp":"いずれも有効。"},
+    # 11
+    {"q":"類似引火点が低いほど？",
+     "choices":["揮発しにくい","火がつきにくい","危険性が高い","臭いが強い"], "ans":3, "exp":"引火点が低い＝少しの加熱で可燃蒸気が出る。"},
+    {"q":"指定数量の倍数が10以上の貯蔵所は？",
+     "choices":["屋内タンク貯蔵所","移動タンク貯蔵所","簡易タンク貯蔵所","屋外タンク貯蔵所"], "ans":4, "exp":"大容量は屋外タンク貯蔵所。"},
+    {"q":"少量危険物に該当するのは？（第2石油類）",
+     "choices":["100L以下","200L以下","400L以下","600L以下"], "ans":1, "exp":"第2石油類の少量危険物は100L以下。"},
+    {"q":"重油の引火点の目安は？",
+     "choices":["−10℃","0℃","30℃","60℃以上"], "ans":4, "exp":"重油は引火点が高い（60℃超）。"},
+    {"q":"軽油の分類は？",
+     "choices":["第1石油類","第2石油類","第3石油類","第4石油類"], "ans":2, "exp":"軽油は第2石油類。指定数量1000L（非水溶性）。"},
+    {"q":"指定数量の倍数が1未満の扱いは？",
+     "choices":["少量危険物","危険物に該当しない","許可不要の危険物","どれでもよい"], "ans":1, "exp":"少量危険物として規制。"},
+    {"q":"貯蔵所の廃止時に必要なのは？",
+     "choices":["市町村長への届出等","何もしない","所轄警察に連絡","国土交通省に申請"], "ans":1, "exp":"消防機関（市町村長）への届出が必要。"},
+    {"q":"第3石油類の代表例は？",
+     "choices":["重油","ガソリン","灯油","アセトン"], "ans":1, "exp":"重油は第3石油類。"},
+    {"q":"アルコール類の代表例は？",
+     "choices":["アセトン","エタノール","ベンゼン","トルエン"], "ans":2, "exp":"エタノール＝アルコール類。"},
+    {"q":"第1石油類の指定数量は？",
+     "choices":["100L","200L","400L","600L"], "ans":2, "exp":"第1石油類は200L。"},
+    # 21
+    {"q":"第2石油類（非水溶性）の指定数量は？",
+     "choices":["200L","400L","1000L","2000L"], "ans":3, "exp":"第2石油類（非水溶性）は1000L。"},
+    {"q":"第3石油類の指定数量は？",
+     "choices":["400L","600L","1000L","2000L"], "ans":4, "exp":"第3石油類は2000L。"},
+    {"q":"第4石油類の指定数量は？",
+     "choices":["4000L","6000L","8000L","10000L"], "ans":1, "exp":"第4石油類は4000L。"},
+    {"q":"水溶性第2石油類の例は？",
+     "choices":["エチレングリコール","軽油","灯油","重油"], "ans":1, "exp":"エチレングリコールは水溶性第2石油類。"},
+    {"q":"危険物の運搬で不適切は？",
+     "choices":["積付の固定","火気の近接","表示の掲示","転倒防止"], "ans":2, "exp":"火気厳禁。近接は不適切。"},
+    {"q":"保安距離・保有空地は？",
+     "choices":["延焼防止等のため必要","景観のため","税制上の要件","任意"], "ans":1, "exp":"延焼・災害拡大防止のため。"},
+    {"q":"屋内貯蔵所で必要な設備は？",
+     "choices":["換気・防火区画等","空調のみ","照明のみ","何も不要"], "ans":1, "exp":"換気・防火区画・消火設備などが必要。"},
+    {"q":"可燃性蒸気の滞留しやすい場所は？",
+     "choices":["高所","床面付近・低所","屋上","樹上"], "ans":2, "exp":"多くは空気より重く低所に滞留。"},
+    {"q":"指定数量以上の貯蔵・取扱には？",
+     "choices":["届出不要","消防法の許可等が必要","所轄警察のみ","厚労省のみ"], "ans":2, "exp":"消防機関の許可等が必要。"},
+    {"q":"危険物の類と品名の組合せで誤りは？",
+     "choices":["第4類‐引火性液体","第1類‐酸化性固体","第2類‐可燃性固体","第6類‐自然発火性液体"], "ans":4, "exp":"第6類は酸化性液体。"},
+    # 31
+    {"q":"静電気対策の基本でないものは？",
+     "choices":["接地","導電化","保温","等電位化"], "ans":3, "exp":"保温は静電気対策ではない。"},
+    {"q":"アセトンの分類は？",
+     "choices":["第1石油類","アルコール類","第2石油類","第3石油類"], "ans":1, "exp":"アセトンは第1石油類（指定数量200L）。"},
+    {"q":"ベンゼンの分類は？",
+     "choices":["第1石油類","第2石油類","第3石油類","第4石油類"], "ans":1, "exp":"ベンゼンは第1石油類。"},
+    {"q":"灯油の指定数量は？",
+     "choices":["200L","400L","600L","1000L"], "ans":1, "exp":"灯油は200Lではなく？→実は第2石油類“非水溶性”で1000L。※確認問題：この選択肢では1が不正。"},
+    {"q":"※上の問題の正答は？（復習）『灯油の指定数量は？』",
+     "choices":["200L","400L","1000L","2000L"], "ans":3, "exp":"正しくは1000L（第2石油類・非水溶性）。"},
+    {"q":"引火点が0℃未満になり得るのは？",
+     "choices":["重油","軽油","ベンゼン","灯油"], "ans":3, "exp":"ベンゼンは非常に低い引火点。"},
+    {"q":"酸化性液体は第何類？",
+     "choices":["第3類","第4類","第5類","第6類"], "ans":4, "exp":"第6類＝酸化性液体。"},
+    {"q":"可燃性固体は第何類？",
+     "choices":["第1類","第2類","第3類","第5類"], "ans":2, "exp":"第2類＝可燃性固体。"},
+    {"q":"自然発火性物質は第何類？",
+     "choices":["第3類","第4類","第5類","第6類"], "ans":3, "exp":"第5類＝自己反応性物質等（自然発火性物質も該当）。"},
+    {"q":"貯蔵所の定期点検で不適切は？",
+     "choices":["漏えい確認","表示確認","消火設備点検","電気容量の契約変更"], "ans":4, "exp":"電力契約は無関係。"},
+    # 41
+    {"q":"危険物製造所等の技術上の基準は？",
+     "choices":["消防法施行令","道路交通法","騒音規制法","電気事業法"], "ans":1, "exp":"消防法・施行令・告示等に規定。"},
+    {"q":"タンクローリーの静電気対策で適切は？",
+     "choices":["接地・ボンディング","水をかける","布でこする","とくに不要"], "ans":1, "exp":"接地・ボンディングが必須。"},
+    {"q":"小分け中に行ってはいけないのは？",
+     "choices":["接地","火気厳禁","携行缶を金属に接触","携帯電話で着信確認"], "ans":4, "exp":"携帯の着火リスクを避ける。"},
+    {"q":"屋外タンクの防油堤の目的は？",
+     "choices":["冷却","油の流出防止","採光","換気"], "ans":2, "exp":"流出防止・延焼防止。"},
+    {"q":"少量危険物の保管で適切は？",
+     "choices":["屋外放置","表示・区画・消火具","火気近くで保管","暖房器具の上"], "ans":2, "exp":"小さくても表示・区画・消火具が必要。"},
+    {"q":"指定数量の合算は？",
+     "choices":["類ごとに合算しない","品名ごとに別計算","類と品名ごとに合算規定あり","一切合算しない"], "ans":3, "exp":"類・品名の合算規定あり。"},
+    {"q":"アルコール類は水に？",
+     "choices":["溶けない","少し溶ける","よく溶けるものが多い","全く関係ない"], "ans":3, "exp":"エタノール等は水溶性。"},
+    {"q":"蒸気爆発を避けるには？",
+     "choices":["密閉強化","冷却・換気・着火源排除","湿度を上げる","周囲を暗くする"], "ans":2, "exp":"可燃濃度や着火源を排除。"},
+    {"q":"保安監督者がすべきことは？",
+     "choices":["在庫管理のみ","安全教育や点検の統括","消火器の使用禁止","消防への報告をしない"], "ans":2, "exp":"安全教育・点検等の統括が職責。"},
+    {"q":"危険物の“類”を定める法律は？",
+     "choices":["消防法","労働基準法","民法","道路運送法"], "ans":1, "exp":"消防法に基づく。"}
 ]
-TOTAL = len(questions)
+# 50問あることを保証（足りなければループで埋める）
+if len(QUIZ) < 50:
+    base = QUIZ.copy()
+    while len(QUIZ) < 50:
+        QUIZ.append(base[len(QUIZ) % len(base)])
 
-# ---- Flex builders ----
-def flex_mid_summary(score, answered, base_url):
-    return {
-        "type": "bubble",
-        "size": "mega",
-        "header": {"type": "box", "layout": "vertical", "contents": [
-            {"type": "text", "text": "🎉 25問クリア！", "weight": "bold", "size": "lg"}
-        ]},
-        "body": {"type": "box", "layout": "vertical", "contents": [
-            {"type": "text", "text": f"ここまでの正解数：{score}/{answered}"},
-            {"type": "text", "text": f"正答率：{round(100*score/max(1,answered))}%"},
-            {"type": "separator", "margin": "md"},
-            {"type": "text", "text": "続きは『次の問題』でどうぞ。", "wrap": True}
-        ]},
-        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
-            {"type": "button", "action": {"type": "uri", "label": "お祝いを見る 🎊",
-                                          "uri": f"{base_url}/celebrate?m=mid"}, "style": "primary"}
-        ]}
+TOTAL_QUESTIONS = 50
+MID_SUMMARY_AT = 25
+
+# ---- ユーザ状態（簡易・メモリ保持）
+# user_id -> dict
+STATE: Dict[str, Dict[str, Any]] = {}
+
+def new_session(user_id: str):
+    order = list(range(len(QUIZ)))
+    random.shuffle(order)
+    STATE[user_id] = {
+        "order": order[:TOTAL_QUESTIONS],
+        "idx": 0,                # 次に出すインデックス（0..49）
+        "answered": 0,           # 回答済み数
+        "correct": 0,            # 正解数
+        "last_result": None      # 直近の正誤
     }
 
-def flex_final_summary(score, total, base_url):
-    return {
-        "type": "bubble",
-        "size": "mega",
-        "header": {"type": "box", "layout": "vertical", "contents": [
-            {"type": "text", "text": "🎊 全問終了！", "weight": "bold", "size": "lg"}
-        ]},
-        "body": {"type": "box", "layout": "vertical", "contents": [
-            {"type": "text", "text": f"最終成績：{score}/{total}"},
-            {"type": "text", "text": f"正答率：{round(100*score/max(1,total))}%"},
-            {"type": "separator", "margin": "md"},
-            {"type": "text", "text": "『リセット』で最初から再挑戦できます。", "wrap": True}
-        ]},
-        "footer": {"type": "box", "layout": "vertical", "spacing": "sm", "contents": [
-            {"type": "button", "action": {"type": "uri", "label": "紙吹雪でお祝い 🎉",
-                                          "uri": f"{base_url}/celebrate?m=final"}, "style": "primary"}
-        ]}
-    }
+def has_session(user_id: str) -> bool:
+    return user_id in STATE
 
-def make_question(s):
-    if s["index"] >= TOTAL:
-        return None
-    q = questions[s["index"]]
-    text = f"Q{s['index']+1}/{TOTAL}: {q['q']}\n"
-    for i, c in enumerate(q["choices"], start=1):
-        text += f"{i}. {c}\n"
-    text += "（1～4で回答）"
-    return text
+def fmt_question(n: int, q: Dict[str, Any]) -> str:
+    # n: 1-based 番号
+    lines = [f"Q{n}/{TOTAL_QUESTIONS}: {q['q']}"]
+    for i, ch in enumerate(q["choices"], start=1):
+        lines.append(f"{i} {ch}")
+    lines.append("（1～4で回答）")
+    return "\n".join(lines)
 
-# ---- Healthcheck ----
+def quick_answers_only() -> QuickReply:
+    # 回答用（①～④）のみ
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="1", text="1")),
+        QuickReplyButton(action=MessageAction(label="2", text="2")),
+        QuickReplyButton(action=MessageAction(label="3", text="3")),
+        QuickReplyButton(action=MessageAction(label="4", text="4")),
+    ])
+
+def quick_reset_help_only() -> QuickReply:
+    # フィードバックの時は リセット / ヘルプ のみ（要望どおり）
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="リセット", text="リセット")),
+        QuickReplyButton(action=MessageAction(label="ヘルプ",   text="ヘルプ")),
+    ])
+
+def send_question(user_id: str):
+    st = STATE[user_id]
+    if st["idx"] >= TOTAL_QUESTIONS:
+        # 全問終了
+        send_final_summary(user_id)
+        return
+    q = QUIZ[st["order"][st["idx"]]]
+    body = fmt_question(st["idx"] + 1, q)
+    line_bot_api.push_message(
+        user_id,
+        TextSendMessage(text=body, quick_reply=quick_answers_only())
+    )
+
+def send_mid_summary(user_id: str):
+    st = STATE[user_id]
+    a, c = st["answered"], st["correct"]
+    rate = (c / a * 100) if a else 0.0
+    msg = f"★中間総括 {a}/{TOTAL_QUESTIONS}問終了\n正解 {c} 問（{rate:.1f}%）\nこの調子で！"
+    line_bot_api.push_message(user_id, TextSendMessage(text=msg))
+
+def send_final_summary(user_id: str):
+    st = STATE.get(user_id, {"answered":0,"correct":0})
+    a, c = st["answered"], st["correct"]
+    rate = (c / a * 100) if a else 0.0
+    msg = f"✅ 全{TOTAL_QUESTIONS}問終了！\n正解 {c} / {a}（{rate:.1f}%）\nおつかれさま！"
+    line_bot_api.push_message(user_id, TextSendMessage(text=msg))
+    # 紙吹雪ページ案内
+    origin = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("ORIGIN") or ""
+    if origin:
+        line_bot_api.push_message(
+            user_id,
+            TextSendMessage(text=f"お祝い 🎉\n{origin}/celebrate を開いて紙吹雪！")
+        )
+    # リセット促し
+    line_bot_api.push_message(
+        user_id,
+        TextSendMessage(text="もう一度やる？「リセット」で再開できるよ。")
+    )
+
+def handle_answer(user_id: str, choice: int):
+    st = STATE[user_id]
+    if st["idx"] >= TOTAL_QUESTIONS:
+        send_final_summary(user_id)
+        return
+
+    q = QUIZ[st["order"][st["idx"]]]
+    st["answered"] += 1
+    correct = (choice == q["ans"])
+    if correct:
+        st["correct"] += 1
+
+    mark = "⭕ 正解！" if correct else "❌ 不正解…"
+    feedback = f"{mark}\n正解は {q['ans']}：{q['choices'][q['ans']-1]}\n（補足）{q['exp']}"
+    line_bot_api.push_message(
+        user_id,
+        TextSendMessage(text=feedback, quick_reply=quick_reset_help_only())
+    )
+
+    st["idx"] += 1
+
+    # 25問/50問の総括
+    if st["idx"] == MID_SUMMARY_AT:
+        send_mid_summary(user_id)
+    if st["idx"] == TOTAL_QUESTIONS:
+        send_final_summary(user_id)
+
+def show_status(user_id: str):
+    st = STATE.get(user_id)
+    if not st:
+        line_bot_api.push_message(user_id, TextSendMessage(text="まだ未回答。『クイズ』で開始！"))
+        return
+    a, c = st["answered"], st["correct"]
+    rate = (c / a * 100) if a else 0.0
+    msg = f"進捗：{a}/{TOTAL_QUESTIONS}問　正解 {c}（{rate:.1f}%）\n『次の問題』で続きへ。"
+    line_bot_api.push_message(user_id, TextSendMessage(text=msg))
+
+HELP_TEXT = (
+    "使い方：\n"
+    "・『クイズ』またはリッチメニューの『次の問題』で開始/続行\n"
+    "・解答は 1～4 を送信\n"
+    "・『成績確認』で途中成績\n"
+    "・『リセット』で最初から\n"
+    "※フィードバック後はボタンが『リセット』『ヘルプ』だけになります（要望対応）"
+)
+
+# ====== ルーティング ======
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ---- Celebrate page (紙吹雪) ----
-# LINE内ブラウザで開いて紙吹雪アニメを表示
 @app.get("/celebrate")
 def celebrate():
-    html = """<!doctype html>
-<html lang="ja"><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+    # シンプル紙吹雪（CSSアニメ）
+    html = """
+<!doctype html><html lang="ja"><meta charset="utf-8">
 <title>おめでとう！</title>
 <style>
-body{margin:0;font-family:sans-serif;background:#111;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;overflow:hidden}
-.box{text-align:center}
-h1{font-size:28px;margin:10px 0}
-p{opacity:.85}
-.btn{display:inline-block;margin-top:16px;padding:10px 16px;background:#06c167;color:#fff;border-radius:8px;text-decoration:none}
-small{display:block;margin-top:12px;opacity:.7}
-canvas{position:fixed;inset:0;pointer-events:none}
+body{margin:0;background:#111;color:#fff;overflow:hidden;font-family:sans-serif}
+h1{position:absolute;top:40%;left:50%;transform:translate(-50%,-50%);font-size:3rem}
+.confetti{position:absolute;width:8px;height:14px;animation:fall 3s linear infinite}
+@keyframes fall{
+  0%{transform:translateY(-100vh) rotate(0)}
+  100%{transform:translateY(110vh) rotate(720deg)}
+}
 </style>
-</head>
 <body>
-<canvas id="cnf"></canvas>
-<div class="box">
-  <h1>🎉 おめでとう！ 🎉</h1>
-  <p>がんばりを称えて紙吹雪をプレゼント！</p>
-  <a class="btn" href="line://msg/text/次の問題">LINEに戻る</a>
-  <small>ボタンで戻れない時は画面を閉じてください。</small>
-</div>
-<script src="https://cdn.jsdelivr.net/npm/canvas-confetti@1.9.3/dist/confetti.browser.min.js"></script>
+<h1>おめでとう！🎉</h1>
 <script>
-const duration = 4000;
-const end = Date.now() + duration;
-(function frame(){
-  confetti({particleCount: 3, angle: 60, spread: 55, origin: {x: 0}});
-  confetti({particleCount: 3, angle: 120, spread: 55, origin: {x: 1}});
-  if (Date.now() < end) requestAnimationFrame(frame);
-})();
+const colors=["#ff4757","#1e90ff","#2ed573","#ffa502","#a29bfe","#ff6b81"];
+function spawn(){
+  const d=document.createElement('div');
+  d.className='confetti';
+  d.style.left= Math.random()*100 + 'vw';
+  d.style.background= colors[Math.floor(Math.random()*colors.length)];
+  d.style.animationDuration= (2.5+Math.random()*1.5)+'s';
+  document.body.appendChild(d);
+  setTimeout(()=>d.remove(),4000);
+}
+setInterval(spawn,8);
 </script>
-</body></html>"""
-    return Response(html, mimetype="text/html; charset=utf-8")
+</body></html>
+"""
+    return HTMLResponse(html)
 
-# ---- LINE Webhook ----
-@app.route("/callback", methods=["POST"])
-def callback():
-    sig = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
+# LINE Webhook
+@app.post("/callback")
+async def callback(request: Request):
+    signature = request.headers.get("X-Line-Signature", "")
+    body = await request.body()
+    body_text = body.decode("utf-8")
+
     try:
-        handler.handle(body, sig)
+        events = parser.parse(body_text, signature)
     except InvalidSignatureError:
-        abort(400)
-    return "OK"
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
-@handler.add(MessageEvent, message=TextMessage)
-def on_message(event: MessageEvent):
-    user_id = event.source.user_id
-    s = sess(user_id)
-    text = event.message.text.strip()
+    for ev in events:
+        if isinstance(ev, MessageEvent) and isinstance(ev.message, TextMessage):
+            user_id = ev.source.user_id
+            text = ev.message.text.strip()
 
-    # ベースURL（Flexボタンの遷移先に使う）
-    # Renderなどは環境変数に入れておくと確実。未設定時は推測不可なので相対でOK。
-    base_url = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
-    if not base_url:
-        # 既知URLがない場合は Render 等の公開URLを直接入れてください。
-        # 例: os.environ["PUBLIC_BASE_URL"]="https://xxxxx.onrender.com"
-        base_url = ""
+            # ---- コマンド系
+            if text in ("ヘルプ", "help", "？", "?"):
+                line_bot_api.reply_message(ev.reply_token, TextSendMessage(text=HELP_TEXT))
+                continue
 
-    # ---- コマンド ----
-    if text == "リセット":
-        sessions[user_id] = {"index": 0, "score": 0, "answered": 0}
-        line_bot_api.reply_message(event.reply_token, TextSendMessage("セッションをリセットしました。『次の問題』で再開できます。"))
-        return
+            if text in ("リセット", "reset"):
+                new_session(user_id)
+                line_bot_api.reply_message(ev.reply_token, TextSendMessage(text="セッションをリセットしました。『次の問題』で再開できます。"))
+                continue
 
-    if text == "成績確認":
-        pct = round(100 * s["score"] / max(1, s["answered"]))
-        line_bot_api.reply_message(event.reply_token,
-            TextSendMessage(f"累積成績：{s['answered']}問中 {s['score']}問正解（{pct}%）"))
-        return
+            if text in ("成績確認", "ステータス"):
+                show_status(user_id)
+                line_bot_api.reply_message(ev.reply_token, TextSendMessage(text="OK"))
+                continue
 
-    if text == "次の問題":
-        qtext = make_question(s)
-        if qtext:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(qtext))
-        else:
-            # すでに全問終了
-            flex = flex_final_summary(s["score"], TOTAL, base_url)
-            line_bot_api.reply_message(event.reply_token,
-                FlexSendMessage(alt_text="全問終了！", contents=flex))
-        return
+            if text in ("クイズ", "開始", "次の問題"):
+                if not has_session(user_id):
+                    new_session(user_id)
+                # 直に次の問題を返す（reply で1発、以後は push）
+                st = STATE[user_id]
+                if st["idx"] >= TOTAL_QUESTIONS:
+                    send_final_summary(user_id)
+                    line_bot_api.reply_message(ev.reply_token, TextSendMessage(text="全問終了済み。『リセット』で再開できます。"))
+                else:
+                    q = QUIZ[st["order"][st["idx"]]]
+                    body = fmt_question(st["idx"] + 1, q)
+                    line_bot_api.reply_message(
+                        ev.reply_token, TextSendMessage(text=body, quick_reply=quick_answers_only())
+                    )
+                continue
 
-    if text == "ヘルプ":
-        help_msg = ("使い方：\n"
-                    "・『次の問題』で出題\n"
-                    "・1～4 で回答\n"
-                    "・『成績確認』で途中結果\n"
-                    "・『リセット』で最初から\n"
-                    "※正解/不正解の後は『リセット』『ヘルプ』のみが出ます。")
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(help_msg))
-        return
+            # ---- 回答（1～4）
+            if text in ("1","２","2","３","3","４","4","１"):
+                if not has_session(user_id):
+                    new_session(user_id)
+                num = text
+                # 全角→半角
+                trans = str.maketrans("１２３４", "1234")
+                choice = int(num.translate(trans))
+                handle_answer(user_id, choice)
+                line_bot_api.reply_message(ev.reply_token, TextSendMessage(text="記録しました。"))
+                continue
 
-    # ---- 回答（数字）----
-    if text.isdigit():
-        if s["index"] < TOTAL:
-            q = questions[s["index"]]
-            ans = int(text)
-            s["answered"] += 1
-            if ans == q["ans"]:
-                s["score"] += 1
-                feedback = "⭕ 正解！"
-            else:
-                feedback = ("❌ 不正解…\n"
-                            f"正解は {q['ans']} : {q['choices'][q['ans']-1]}\n"
-                            f"(補足) {q['exp']}")
+            # その他
+            line_bot_api.reply_message(ev.reply_token, TextSendMessage(text="『クイズ』『次の問題』『成績確認』『リセット』『ヘルプ』が使えます。"))
 
-            # 正解/不正解直後は リセット と ヘルプのみ
-            qr = QuickReply(items=[
-                QuickReplyButton(action=MessageAction(label="リセット", text="リセット")),
-                QuickReplyButton(action=MessageAction(label="ヘルプ", text="ヘルプ")),
-            ])
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(feedback, quick_reply=qr))
-
-            s["index"] += 1
-
-            # 25問総括（押しメッセージ）
-            if s["index"] == 25:
-                flex = flex_mid_summary(s["score"], s["answered"], base_url)
-                line_bot_api.push_message(user_id, FlexSendMessage(alt_text="25問クリア！", contents=flex))
-
-            # 50問（最終）総括
-            if s["index"] == TOTAL:
-                flex = flex_final_summary(s["score"], TOTAL, base_url)
-                line_bot_api.push_message(user_id, FlexSendMessage(alt_text="全問終了！", contents=flex))
-        return
-
-if __name__ == "__main__":
-    # Render等で PORT が与えられる想定
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    return JSONResponse({"status":"ok"})
