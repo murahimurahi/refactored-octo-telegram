@@ -8,39 +8,54 @@ from linebot.models import (
     QuickReply, QuickReplyButton, MessageAction
 )
 
-# -----------------------------
+# ======================
 # Flask
-# -----------------------------
+# ======================
 app = Flask(__name__)
-
-@app.get("/")
-def root():
-    return jsonify({"ok": True})
 
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
 
-# -----------------------------
-# LINE keys（環境変数に入れてね）
-# -----------------------------
+# ======================
+# LINE keys（Renderの環境変数に設定）
+# ======================
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "YOUR_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "YOUR_CHANNEL_SECRET")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# -----------------------------
-# 過去問 50問（法令/物理化学/性質消火をバランス投入）
-# ans は 1〜4、exp は解説
-# -----------------------------
+# ======================
+# ヘルプ文（指定どおり）
+# ======================
+HELP_TEXT = (
+    "📘使い方\n"
+    "・「次の問題」ボタンもしくは「開始」コメント手入力でクイズ開始（全50問）\n"
+    "・4択ボタン(1〜4)をタップで回答。手入力 1〜4 でもOK\n"
+    "・25問目と50問目で成績を自動集計\n"
+    "・「リセット」で最初からやり直し\n"
+    "・分野バランスは法令/物理化学/性質消火をミックスしています。\n"
+)
+
+def qr_navigation():
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="▶ 次の問題", text="次の問題")),
+        QuickReplyButton(action=MessageAction(label="🔄 リセット", text="リセット")),
+        QuickReplyButton(action=MessageAction(label="❓ ヘルプ", text="ヘルプ")),
+    ])
+
+# ======================
+# 過去問 50問（法令/物理化学/性質消火）
+# ans は 1〜4、exp は補足
+# ======================
 Q = [
 # ---- 法令（1〜18） ----
 {"q":"第4類危険物の本質は？","choices":["酸化性液体","引火性液体","可燃性液体","腐食性液体"],"ans":2,"exp":"乙4は“引火性液体”を扱う免状。"},
 {"q":"危険物取扱者免状を交付するのは？","choices":["消防庁長官","市町村長","都道府県知事","消防署長"],"ans":3,"exp":"免状交付は都道府県知事。"},
-{"q":"製造所等の許可権者は？","choices":["消防庁長官","都道府県知事","市町村長","消防署長"],"ans":2,"exp":"許可は基本都道府県知事（条例で政令市等へ委任あり）。"},
+{"q":"製造所等の許可権者は？","choices":["消防庁長官","都道府県知事","市町村長","消防署長"],"ans":2,"exp":"許可は基本都道府県知事（条例で委任あり）。"},
 {"q":"少量危険物の上限（第4類）は？","choices":["指定数量の十分の一未満","指定数量の五分の一未満","指定数量未満","指定数量の二分の一未満"],"ans":1,"exp":"“少量危険物”は指定数量の1/10未満。"},
 {"q":"少量危険物の“倍数”の数え方は？","choices":["切り上げ","切り捨て","四捨五入","端数は0扱い"],"ans":1,"exp":"少量倍数は切り上げ。"},
-{"q":"貯蔵・取扱いの“届出先”は？","choices":["都道府県知事","消防署長等","総務大臣","市町村長"],"ans":2,"exp":"届出や規制の実務は消防機関（消防長/消防署長等）。"},
+{"q":"貯蔵・取扱いの“届出先”は？","choices":["都道府県知事","消防署長等","総務大臣","市町村長"],"ans":2,"exp":"実務は消防機関（消防長/消防署長等）。"},
 {"q":"危険物の規制に関する政令は？","choices":["消防法施行令","労働安全衛生法施行令","毒劇法施行令","危険物運搬令"],"ans":1,"exp":"消防法施行令がベース。"},
 {"q":"屋内貯蔵所の所要床面積区画に関係するのは？","choices":["防火壁","防液堤","防油堤","防火戸"],"ans":2,"exp":"液体なので“防液堤”（防油堤同義）。"},
 {"q":"仮貯蔵・仮取扱いの許可権者は？","choices":["消防庁長官","消防署長等","都道府県知事","市町村長"],"ans":2,"exp":"実務は消防署長等。"},
@@ -48,7 +63,7 @@ Q = [
 {"q":"定期点検を要するのは？","choices":["仮貯蔵のみ","少量危険物のみ","指定数量以上の製造所等","全て不要"],"ans":3,"exp":"指定数量以上の製造所等は保安検査等が必要。"},
 {"q":"危険物取扱者が“立会い”を要する作業は？","choices":["帳票作成","清掃","注油・抜油等の危険物の移動","見回り"],"ans":3,"exp":"危険物の移動・移送は立会い対象。"},
 {"q":"危険物の分類表示で第4類の色は？","choices":["赤","黄","青","緑"],"ans":1,"exp":"第4類は“赤”。"},
-{"q":"異種混合で特に禁忌は？","choices":["水と混合","酸化剤と混合","空気と混合","窒素と混合"],"ans":2,"exp":"第4類は酸化剤と混合厳禁（爆発・激発火）。"},
+{"q":"異種混合で特に禁忌は？","choices":["水と混合","酸化剤と混合","空気と混合","窒素と混合"],"ans":2,"exp":"第4類は酸化剤と混合厳禁。"},
 {"q":"指定数量1000Lの品目は？","choices":["重油","ガソリン","灯油","アルコール類"],"ans":1,"exp":"重油は1000L、灯油・軽油も1000L、ガソリンは200L。"},
 {"q":"給油取扱所の火気使用は？","choices":["指定場所で可","原則禁止","自由","消防長許可で可"],"ans":2,"exp":"火気厳禁。"},
 {"q":"危険物の運搬で積載方法の原則は？","choices":["横積み","縦積み","重量物下・軽量物上","斜め積み"],"ans":3,"exp":"重い物を下、軽い物を上に。"},
@@ -62,7 +77,7 @@ Q = [
 {"q":"可燃性液体の蒸気が最も発生しやすいのは？","choices":["表面積大・温度高・風通し良","表面積小・温度低","密閉・低温","表面積小・高湿"],"ans":1,"exp":"表面積↑・温度↑で蒸発↑。"},
 {"q":"水に不溶・比重<1の第4類の流出時、堰内でどうなる？","choices":["水層の下に沈む","水面に浮く","水と混ざる","勝手に蒸発する"],"ans":2,"exp":"比重<1・不溶→水面に浮上。"},
 {"q":"メタノールの特徴","choices":["毒性なし","水に溶けない","水に任意に混和","比重>1で沈む"],"ans":3,"exp":"メタノールは水と任意混和、毒性あり。"},
-{"q":"アセトンの分類","choices":["第1石油類","アルコール類","第2石油類","第3石油類"],"ans":1,"exp":"アセトンは第1石油類（非水溶性ではないが法分類は第1）。"},
+{"q":"アセトンの分類","choices":["第1石油類","アルコール類","第2石油類","第3石油類"],"ans":1,"exp":"アセトンは第1石油類（法分類）。"},
 {"q":"灯油の指定数量","choices":["200L","400L","1000L","2000L"],"ans":3,"exp":"灯油・軽油は1000L。"},
 {"q":"ガソリンの沸点域（概略）","choices":["30〜200℃","-20〜20℃","200〜350℃","80〜120℃"],"ans":1,"exp":"軽質〜中質の広い範囲。"},
 {"q":"静電気対策で有効でないもの","choices":["アース","流速を上げる","導電性ホース","加湿"],"ans":2,"exp":"流速を上げると帯電しやすい。"},
@@ -87,24 +102,18 @@ Q = [
 {"q":"第1石油類に該当","choices":["重油","灯油","ガソリン","軽油"],"ans":3,"exp":"ガソリンは第1石油類（非水溶性）。"},
 {"q":"水溶性第1石油類の代表","choices":["酢酸エチル","メタノール","ベンゼン","キシレン"],"ans":1,"exp":"酢酸エチルは水にやや溶ける（法上は第1石油類）。"}
 ]
-# ここまでで 50 問
-
 TOTAL = len(Q)  # 50
 
-# -----------------------------
-# セッション（超簡易・メモリ）
-# -----------------------------
-state = {}  # user_id -> {"i":0, "score":0}
+# ======================
+# ユーザー状態（超簡易）
+# ======================
+# uid -> {"i": 現在インデックス, "score": 正解数, "ready": Trueなら「次の問題」で開始可}
+STATE = {}
 
-def help_text():
-    return (
-        "📘使い方\n"
-        "・「開始」でクイズ開始（全50問）\n"
-        "・4択ボタン(1〜4)をタップで回答。手入力 1〜4 でもOK\n"
-        "・25問目と50問目で成績を自動集計\n"
-        "・「リセット」で最初からやり直し\n"
-        "・分野バランスは法令/物理化学/性質消火をミックス\n"
-        "※問題文の言い回しや配分は後日調整予定\n"
+def send_usage(reply_token):
+    line_bot_api.reply_message(
+        reply_token,
+        TextSendMessage(text=HELP_TEXT, quick_reply=qr_navigation())
     )
 
 def quick_for(q):
@@ -118,20 +127,23 @@ def quick_for(q):
     ])
 
 def send_question(reply_token, uid):
-    s = state.setdefault(uid, {"i": 0, "score": 0})
+    s = STATE.setdefault(uid, {"i": 0, "score": 0, "ready": True})
     i = s["i"]
     if i >= TOTAL:
         line_bot_api.reply_message(
             reply_token,
-            TextSendMessage(text=f"全{TOTAL}問お疲れさま！最終成績：{s['score']} / {TOTAL}\n「リセット」で再挑戦できます。")
+            TextSendMessage(text=f"✅ 全{TOTAL}問終了！最終成績：{s['score']} / {TOTAL}\n「リセット」で再挑戦できます。")
         )
         return
     q = Q[i]
-    text = f"Q{i+1}/{TOTAL}: {q['q']}\n1 {q['choices'][0]}\n2 {q['choices'][1]}\n3 {q['choices'][2]}\n4 {q['choices'][3]}"
-    line_bot_api.reply_message(reply_token, TextSendMessage(text=text, quick_reply=quick_for(q)))
+    text = f"Q{i+1}/{TOTAL}\n{q['q']}\n1 {q['choices'][0]}\n2 {q['choices'][1]}\n3 {q['choices'][2]}\n4 {q['choices'][3]}"
+    line_bot_api.reply_message(
+        reply_token,
+        TextSendMessage(text=text, quick_reply=quick_for(q))
+    )
 
 def handle_answer(reply_token, uid, choice_num):
-    s = state[uid]
+    s = STATE[uid]
     q = Q[s["i"]]
     correct = q["ans"]
     ok = (choice_num == correct)
@@ -140,24 +152,24 @@ def handle_answer(reply_token, uid, choice_num):
         head = "⭕ 正解！"
     else:
         head = f"❌ 不正解… 正解は {correct}：{q['choices'][correct-1]}"
-    body = f"(補足) {q['exp']}"
+    body = f"(補足) {q.get('exp','')}"
     s["i"] += 1
-
-    # 25 / 50 で総括コメント
     reached = s["i"]
+
+    # 25 / 50 で総括
     footer = ""
     if reached in (25, 50):
-        footer = f"\n\n— ここまでの成績 —\n{reached}問中 {s['score']} 正解（{round(s['score']/reached*100,1)}%）"
-    msg = f"{head}\n{body}{footer}"
-    line_bot_api.reply_message(reply_token, TextSendMessage(text=msg))
+        rate = round(s["score"]/reached*100, 1)
+        footer = f"\n\n— ここまでの成績 —\n{reached}問中 {s['score']} 正解（{rate}%）"
 
-    # まだ続く場合は次の問題をすぐ出す
-    if reached < TOTAL:
-        send_question(reply_token, uid)
+    line_bot_api.reply_message(
+        reply_token,
+        TextSendMessage(text=f"{head}\n{body}{footer}", quick_reply=qr_navigation())
+    )
 
-# -----------------------------
+# ======================
 # Webhook
-# -----------------------------
+# ======================
 @app.post("/callback")
 def callback():
     signature = request.headers.get('X-Line-Signature', '')
@@ -173,35 +185,36 @@ def on_message(event: MessageEvent):
     uid = event.source.user_id
     text = event.message.text.strip()
 
-    # コマンド
-    if text == "ヘルプ":
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=help_text()))
+    # 最初 or リセット or ヘルプ → 使い方表示（次の問題で進む）
+    if text in {"開始", "リセット", "ヘルプ"}:
+        STATE[uid] = {"i": 0, "score": 0, "ready": True}
+        send_usage(event.reply_token)
         return
-    if text == "リセット":
-        state[uid] = {"i": 0, "score": 0}
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🔁リセットしました。「開始」で再開します。"))
-        return
-    if text == "開始":
-        state.setdefault(uid, {"i": 0, "score": 0})
+
+    # 使い方表示のあと、「次の問題」で進む
+    if text == "次の問題":
+        if uid not in STATE:
+            STATE[uid] = {"i": 0, "score": 0, "ready": True}
         send_question(event.reply_token, uid)
         return
 
     # 回答（1〜4）
-    if text in {"1","2","3","4"} and uid in state:
+    if text in {"1","2","3","4"} and uid in STATE:
         handle_answer(event.reply_token, uid, int(text))
+        # 次の問題はユーザーが「次の問題」を押す or そのまま再度「次の問題」で進行
         return
 
-    # 初回案内
+    # フォールバック：初回案内
+    if uid not in STATE:
+        STATE[uid] = {"i": 0, "score": 0, "ready": True}
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(
-            text="ようこそ！乙4クイズ（全50問）\n「開始」でスタート / 「ヘルプ」で使い方 / 「リセット」で最初から"
-        )
+        TextSendMessage(text="ようこそ！\nまずは「開始」または「ヘルプ」と送ってください。")
     )
 
-# -----------------------------
-# run
-# -----------------------------
+# ======================
+# Local run (RenderではProcfile/Start Commandで起動)
+# ======================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
