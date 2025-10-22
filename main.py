@@ -26,7 +26,7 @@ line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
 # ======================
-# ヘルプ文（指定どおり）
+# 使い方（リセット時のみ表示）
 # ======================
 HELP_TEXT = (
     "📘使い方\n"
@@ -37,11 +37,17 @@ HELP_TEXT = (
     "・分野バランスは法令/物理化学/性質消火をミックスしています。\n"
 )
 
-def qr_navigation():
+def qr_after_answer():
+    # 回答後は「リセット」と「ヘルプ」のみ（要望どおり）
     return QuickReply(items=[
-        QuickReplyButton(action=MessageAction(label="▶ 次の問題", text="次の問題")),
         QuickReplyButton(action=MessageAction(label="🔄 リセット", text="リセット")),
         QuickReplyButton(action=MessageAction(label="❓ ヘルプ", text="ヘルプ")),
+    ])
+
+def qr_next_only():
+    # 任意：最初に自分で「次の問題」と送る運用なら不要。開始直後に出すボタン用に定義
+    return QuickReply(items=[
+        QuickReplyButton(action=MessageAction(label="▶ 次の問題", text="次の問題")),
     ])
 
 # ======================
@@ -105,41 +111,39 @@ Q = [
 TOTAL = len(Q)  # 50
 
 # ======================
-# ユーザー状態（超簡易）
+# 状態（超簡易：メモリ）
 # ======================
-# uid -> {"i": 現在インデックス, "score": 正解数, "ready": Trueなら「次の問題」で開始可}
+# uid -> {"i": 現在問index, "score": 正解数}
 STATE = {}
 
-def send_usage(reply_token):
-    line_bot_api.reply_message(
-        reply_token,
-        TextSendMessage(text=HELP_TEXT, quick_reply=qr_navigation())
-    )
-
-def quick_for(q):
-    return QuickReply(items=[
-        QuickReplyButton(action=MessageAction(label=f"① {q['choices'][0]}", text="1")),
-        QuickReplyButton(action=MessageAction(label=f"② {q['choices'][1]}", text="2")),
-        QuickReplyButton(action=MessageAction(label=f"③ {q['choices'][2]}", text="3")),
-        QuickReplyButton(action=MessageAction(label=f"④ {q['choices'][3]}", text="4")),
-        QuickReplyButton(action=MessageAction(label="ヘルプ", text="ヘルプ")),
-        QuickReplyButton(action=MessageAction(label="リセット", text="リセット")),
-    ])
-
 def send_question(reply_token, uid):
-    s = STATE.setdefault(uid, {"i": 0, "score": 0, "ready": True})
+    s = STATE.setdefault(uid, {"i": 0, "score": 0})
     i = s["i"]
     if i >= TOTAL:
         line_bot_api.reply_message(
             reply_token,
-            TextSendMessage(text=f"✅ 全{TOTAL}問終了！最終成績：{s['score']} / {TOTAL}\n「リセット」で再挑戦できます。")
+            TextSendMessage(text=f"✅ 全{TOTAL}問終了！最終成績：{s['score']} / {TOTAL}\n「リセット」で再挑戦できます。", quick_reply=qr_after_answer())
         )
         return
     q = Q[i]
     text = f"Q{i+1}/{TOTAL}\n{q['q']}\n1 {q['choices'][0]}\n2 {q['choices'][1]}\n3 {q['choices'][2]}\n4 {q['choices'][3]}"
+    # 出題時は4択のみ（開始時にだけ“次の問題”ボタンを出したいなら qr_next_only に差し替え）
     line_bot_api.reply_message(
         reply_token,
-        TextSendMessage(text=text, quick_reply=quick_for(q))
+        TextSendMessage(text=text,
+                        quick_reply=QuickReply(items=[
+                            QuickReplyButton(action=MessageAction(label=f"① {q['choices'][0]}", text="1")),
+                            QuickReplyButton(action=MessageAction(label=f"② {q['choices'][1]}", text="2")),
+                            QuickReplyButton(action=MessageAction(label=f"③ {q['choices'][2]}", text="3")),
+                            QuickReplyButton(action=MessageAction(label=f"④ {q['choices'][3]}", text="4")),
+                        ]))
+    )
+
+def send_usage(reply_token):
+    # リセット時のみ使い方を出す（要望）
+    line_bot_api.reply_message(
+        reply_token,
+        TextSendMessage(text=HELP_TEXT, quick_reply=qr_next_only())
     )
 
 def handle_answer(reply_token, uid, choice_num):
@@ -164,8 +168,9 @@ def handle_answer(reply_token, uid, choice_num):
 
     line_bot_api.reply_message(
         reply_token,
-        TextSendMessage(text=f"{head}\n{body}{footer}", quick_reply=qr_navigation())
+        TextSendMessage(text=f"{head}\n{body}{footer}", quick_reply=qr_after_answer())
     )
+    # 「次の問題」はボタンを出さない方針なので、ユーザーが自分で「次の問題」と送る
 
 # ======================
 # Webhook
@@ -185,35 +190,48 @@ def on_message(event: MessageEvent):
     uid = event.source.user_id
     text = event.message.text.strip()
 
-    # 最初 or リセット or ヘルプ → 使い方表示（次の問題で進む）
-    if text in {"開始", "リセット", "ヘルプ"}:
-        STATE[uid] = {"i": 0, "score": 0, "ready": True}
+    # リセット → 使い方を表示（“次の問題”で進む）
+    if text == "リセット":
+        STATE[uid] = {"i": 0, "score": 0}
         send_usage(event.reply_token)
         return
 
-    # 使い方表示のあと、「次の問題」で進む
+    # ヘルプ（内容は指定のヘルプ文）
+    if text == "ヘルプ":
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=HELP_TEXT, quick_reply=qr_after_answer())
+        )
+        return
+
+    # 開始 → 状態セットして最初の出題（開始直後に「次の問題」押させるなら下の行をコメントアウト）
+    if text == "開始":
+        STATE[uid] = {"i": 0, "score": 0}
+        send_question(event.reply_token, uid)
+        return
+
+    # 次の問題 → 現在のインデックスから出題
     if text == "次の問題":
         if uid not in STATE:
-            STATE[uid] = {"i": 0, "score": 0, "ready": True}
+            STATE[uid] = {"i": 0, "score": 0}
         send_question(event.reply_token, uid)
         return
 
     # 回答（1〜4）
     if text in {"1","2","3","4"} and uid in STATE:
         handle_answer(event.reply_token, uid, int(text))
-        # 次の問題はユーザーが「次の問題」を押す or そのまま再度「次の問題」で進行
         return
 
-    # フォールバック：初回案内
+    # フォールバック（初回など）
     if uid not in STATE:
-        STATE[uid] = {"i": 0, "score": 0, "ready": True}
+        STATE[uid] = {"i": 0, "score": 0}
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(text="ようこそ！\nまずは「開始」または「ヘルプ」と送ってください。")
+        TextSendMessage(text="「開始」または「リセット」「ヘルプ」、進めるときは「次の問題」と送ってください。", quick_reply=qr_next_only())
     )
 
 # ======================
-# Local run (RenderではProcfile/Start Commandで起動)
+# Local run（RenderではProcfile/Start Commandで起動）
 # ======================
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
